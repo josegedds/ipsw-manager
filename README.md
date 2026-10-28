@@ -8,7 +8,8 @@ Docker image: [`josephgeddes/ipsw-manager`](https://hub.docker.com/r/josephgedde
 
 - On a cron schedule (default: every day at 18:00 GMT), `ipsw-manager.sh` asks [ipsw.me](https://ipsw.me) for the latest signed, non-beta firmware for each selected iPhone.
 - Phones that share a firmware file are de-duplicated, so each IPSW downloads once.
-- Each download is checked against its MD5 or SHA-256 checksum. Verified hashes are cached so later runs don't re-read the files.
+- Each download is checked against its MD5 or SHA-256 checksum. Verified hashes are cached (in `.hash-cache/` in the download folder) so later runs don't re-read the files.
+- Only one run happens at a time; a scheduled run that starts while another is going is skipped.
 - IPSWs that are no longer current, or belong to phones you've unticked, are deleted.
 
 ## Web UI
@@ -35,12 +36,18 @@ docker run -d --name ipsw-manager \
 | `IPSW_DOWNLOAD_DIR` | `/downloads` | Where IPSWs, the log and the selection are stored |
 | `IPSW_CHECKSUM_ALGO` | `md5` | `md5` or `sha256` |
 | `IPSW_SELECTION_FILE` | `$IPSW_DOWNLOAD_DIR/selected-devices.json` | Saved phone selection |
+| `IPSW_HASH_CACHE_DIR` | `$IPSW_DOWNLOAD_DIR/.hash-cache` | Cache of verified checksums |
+| `CRON_SCHEDULE` | `0 18 * * *` | When to run (cron syntax, UTC) |
 | `WEBUI_PORT` | `8080` | Web UI port |
 
-The cron schedule is set at build time, and the container runs in UTC:
+The schedule uses cron syntax, read by [supercronic](https://github.com/aptible/supercronic), and the container runs in UTC. To run at 06:00 instead:
 
 ```bash
-docker build --build-arg CRON_SCHEDULE="0 18 * * *" -t josephgeddes/ipsw-manager .
+docker run -d --name ipsw-manager \
+  -p 8080:8080 \
+  -e CRON_SCHEDULE="0 6 * * *" \
+  -v /path/to/ipsw:/downloads \
+  josephgeddes/ipsw-manager:latest
 ```
 
 ## Releasing a new version

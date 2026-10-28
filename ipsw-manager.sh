@@ -12,15 +12,27 @@ LOG_FILE="${DOWNLOAD_DIR}/ipsw-manager.log"
 # Phones picked in the web UI, as a JSON array of identifiers. If it doesn't
 # exist yet, every iPhone 11 and newer is downloaded.
 SELECTION_FILE="${IPSW_SELECTION_FILE:-${DOWNLOAD_DIR}/selected-devices.json}"
-# Hash cache lives inside the container — avoids re-reading files from the
-# NAS on subsequent runs. Stored as <filename>.hash, one line: "<algo> <hash>"
-HASH_CACHE_DIR="/var/cache/ipsw-manager"
+# Hash cache — avoids re-reading whole IPSWs from the NAS on later runs.
+# Kept next to the downloads by default so it survives container updates.
+# Stored as <filename>.hash, one line: "<algo> <hash>"
+HASH_CACHE_DIR="${IPSW_HASH_CACHE_DIR:-${DOWNLOAD_DIR}/.hash-cache}"
 mkdir -p "$DOWNLOAD_DIR" "$HASH_CACHE_DIR"
 
 log() {
   local MSG="$1"
   printf "%s  %s\n" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$MSG" | tee -a "$LOG_FILE"
 }
+
+# Only one run at a time: the schedule and the web UI's Run Now would
+# otherwise download into the same .partial files and both clean up.
+# The lock is local (not on the NAS), where flock is reliable.
+if command -v flock &>/dev/null; then
+  exec 9>"${TMPDIR:-/tmp}/ipsw-manager.lock"
+  if ! flock -n 9; then
+    log "⏭  Another run is already in progress — skipping this one."
+    exit 0
+  fi
+fi
 
 DEVICES=()
 if [[ -s "$SELECTION_FILE" ]]; then

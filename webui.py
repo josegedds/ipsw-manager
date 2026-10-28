@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DOWNLOAD_DIR = os.environ.get("IPSW_DOWNLOAD_DIR", "/downloads")
-HASH_CACHE_DIR = "/var/cache/ipsw-manager"
+HASH_CACHE_DIR = os.environ.get("IPSW_HASH_CACHE_DIR", os.path.join(DOWNLOAD_DIR, ".hash-cache"))
 LOG_FILE = os.path.join(DOWNLOAD_DIR, "ipsw-manager.log")
 SELECTION_FILE = os.environ.get(
     "IPSW_SELECTION_FILE", os.path.join(DOWNLOAD_DIR, "selected-devices.json")
@@ -144,7 +144,7 @@ def trigger_run(clear_cache=False):
                 except OSError:
                     pass
             subprocess.run(
-                ["/usr/local/bin/run-ipsw-manager.sh"],
+                ["/usr/local/bin/ipsw-manager.sh"],
                 start_new_session=True,
             )
         finally:
@@ -326,7 +326,7 @@ function colorLine(line) {
   if (/❌|failed|mismatch|error/i.test(line)) return '<span class="err">' + e + '</span>';
   if (/⚠|warn|skip/i.test(line)) return '<span class="warn">' + e + '</span>';
   if (/⬇|Downloading|Fetching|fetch/i.test(line)) return '<span class="info">' + e + '</span>';
-  if (/^\s*$/.test(line)) return e;
+  if (/^\\s*$/.test(line)) return e;
   return '<span class="dim">' + e + '</span>';
 }
 
@@ -377,7 +377,7 @@ async function refresh() {
   if (atBottom) logEl.scrollTop = logEl.scrollHeight;
 
   if (d.last_run) {
-    document.getElementById("last-run-text").textContent = "Last run: " + d.last_run.replace(/^[^Z]+Z\s+/, "");
+    document.getElementById("last-run-text").textContent = "Last run: " + d.last_run.replace(/^[^Z]+Z\\s+/, "");
   }
 }
 
