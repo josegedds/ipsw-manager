@@ -1,5 +1,4 @@
-.git
-.gitignore
-.gitattributes
-README.md
-ipsw/
+*
+!ipsw-manager.sh
+!webui.py
+!entrypoint.sh
