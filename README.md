@@ -63,12 +63,26 @@ sudo chown -R 1000:1000 /path/to/ipsw
 
 ## Releasing a new version
 
-Build for Intel and ARM (most NAS boxes are one or the other) and push in one step:
+Push a version tag from `main`:
+
+```bash
+git tag v1.2.0
+```
+
+```bash
+git push origin v1.2.0
+```
+
+The [Release image](.github/workflows/release.yml) workflow builds for Intel and ARM (most NAS boxes are one or the other) and pushes `josephgeddes/ipsw-manager:1.2.0`, `:1.2` and `:latest` to Docker Hub. Pre-release tags like `v1.2.0-rc1` don't move `:latest`. Follow the run under the repository's **Actions** tab.
+
+The workflow needs two repository secrets, `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token with Read & Write permission).
+
+To build and push by hand instead:
 
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 \
-  --build-arg VERSION=1.2 \
-  -t josephgeddes/ipsw-manager:1.2 -t josephgeddes/ipsw-manager:latest \
+  --build-arg VERSION=1.2.0 \
+  -t josephgeddes/ipsw-manager:1.2.0 -t josephgeddes/ipsw-manager:latest \
   --push .
 ```
 
