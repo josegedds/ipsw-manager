@@ -1,0 +1,7 @@
+# Local test downloads and state
+ipsw/
+*.ipsw
+*.ipsw.partial
+*.log
+selected-devices.json
+__pycache__/
