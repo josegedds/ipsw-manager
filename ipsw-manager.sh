@@ -78,7 +78,10 @@ log "📱 Checking ${#DEVICES[@]} iPhone devices — fetching firmware metadata.
 
 META_DIR=$(mktemp -d)
 TMP_FILE=$(mktemp)
-trap "rm -f $TMP_FILE; rm -rf $META_DIR" EXIT
+# Name and expected size of the file being downloaded, so the web UI can
+# show a percentage and time remaining. Inside the container, not on the NAS.
+PROGRESS_FILE="${TMPDIR:-/tmp}/ipsw-manager-download"
+trap "rm -f $TMP_FILE $PROGRESS_FILE; rm -rf $META_DIR" EXIT
 
 fetch_meta() {
   local DEVICE="$1"
@@ -313,6 +316,7 @@ download_unique() {
   local POLLER_PID=$!
 
   draw_progress "$LABEL" "$VERSION" 0 "$FILESIZE"
+  printf '%s\n%s\n' "$FILE_NAME" "$FILESIZE" > "$PROGRESS_FILE"
 
   # Stream curl output through tee into the hash utility simultaneously.
   # This computes the checksum during the download rather than re-reading
@@ -339,6 +343,7 @@ download_unique() {
 
   kill "$POLLER_PID" 2>/dev/null
   wait "$POLLER_PID" 2>/dev/null || true
+  rm -f "$PROGRESS_FILE"
 
   if (( CURL_OK != 0 )); then
     rm -f "$PARTIAL_PATH"

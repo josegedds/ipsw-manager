@@ -30,6 +30,8 @@ _run_lock = threading.Lock()
 _io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="ipsw-io")
 IO_TIMEOUT = 5  # seconds before giving up on a CIFS read
 SPEED_WINDOW = 15  # seconds of .partial size samples used to work out download speed
+# Written by ipsw-manager.sh while it downloads: file name, then expected bytes.
+PROGRESS_FILE = os.path.join(os.environ.get("TMPDIR", "/tmp"), "ipsw-manager-download")
 
 _speed_samples = {}  # .partial file name -> deque of (monotonic time, size)
 _speed_lock = threading.Lock()
@@ -102,6 +104,26 @@ def download_speed(name, size):
         return (size - start_size) / (now - start)
 
 
+def read_expected_size():
+    """(file name, expected bytes) of the file being downloaded, or (None, 0)."""
+    try:
+        name, size = Path(PROGRESS_FILE).read_text(encoding="utf-8").split()[:2]
+        return name, int(size)
+    except (OSError, ValueError):
+        return None, 0
+
+
+def format_duration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} s"
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes} min" if minutes else f"{hours} h"
+
+
 def forget_speeds(active_names):
     with _speed_lock:
         for name in set(_speed_samples) - set(active_names):
@@ -137,6 +159,7 @@ def get_downloads():
         pass
 
     partials = []
+    expected_name, expected_size = read_expected_size()
     try:
         for path in sorted(download_path.glob("*.ipsw.partial")):
             try:
@@ -146,6 +169,9 @@ def get_downloads():
             partials.append(path.name)
             ipsw_name = path.stem  # strips .partial, keeps .ipsw
             speed = download_speed(path.name, stat.st_size)
+            total = expected_size if ipsw_name == expected_name and expected_size > 0 else None
+            percent = min(100.0, stat.st_size * 100 / total) if total else None
+            eta = (total - stat.st_size) / speed if total and speed and speed > 0 else None
             results.append(
                 {
                     "name": ipsw_name,
@@ -157,6 +183,9 @@ def get_downloads():
                     "version": extract_version(ipsw_name),
                     "speed": speed,
                     "speed_human": format_size(speed) + "/s" if speed is not None else None,
+                    "total_human": format_size(total) if total else None,
+                    "percent": percent,
+                    "eta_human": format_duration(max(eta, 0)) + " left" if eta is not None else None,
                 }
             )
     except OSError:
@@ -277,6 +306,8 @@ tr:last-child td{border-bottom:none}
 tr:hover td{background:rgba(255,255,255,.025)}
 .mono{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:12px}
 .speed{display:block;color:#58a6ff;font-size:11px;margin-top:2px}
+.bar{height:4px;width:160px;max-width:100%;background:#21262d;border-radius:2px;margin-top:5px;overflow:hidden}
+.bar>span{display:block;height:100%;background:#58a6ff;transition:width .5s}
 .badge{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap}
 .badge-green{background:rgba(63,185,80,.13);color:#3fb950}
 .badge-blue{background:rgba(88,166,255,.13);color:#58a6ff;animation:pulse 1.5s ease-in-out infinite}
@@ -402,7 +433,7 @@ async function refresh() {
       return '<tr>'
         + '<td class="mono">' + f.name + '</td>'
         + '<td>' + (f.version !== "—" ? 'iOS ' + f.version : f.version) + '</td>'
-        + '<td class="mono">' + f.size_human + speedLabel(f) + '</td>'
+        + '<td class="mono">' + f.size_human + (f.total_human ? ' of ' + f.total_human : '') + speedLabel(f) + '</td>'
         + '<td style="color:#8b949e">' + fmt(f.mtime) + '</td>'
         + '<td>' + badge + '</td>'
         + '</tr>';
@@ -421,7 +452,14 @@ async function refresh() {
 
 function speedLabel(f) {
   if (f.status !== "downloading") return "";
-  return '<span class="speed">' + (f.speed_human || "measuring…") + '</span>';
+  const parts = [];
+  if (f.percent != null) parts.push(Math.floor(f.percent) + "%");
+  parts.push(f.speed_human || "measuring…");
+  if (f.eta_human) parts.push(f.eta_human);
+  const bar = f.percent != null
+    ? '<div class="bar"><span style="width:' + f.percent.toFixed(1) + '%"></span></div>'
+    : "";
+  return bar + '<span class="speed">' + parts.join(" · ") + '</span>';
 }
 
 async function doRun(clearCache) {
