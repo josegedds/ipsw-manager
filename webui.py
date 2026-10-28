@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Web dashboard for ipsw-manager. No external dependencies — stdlib only."""
 
+import collections
 import concurrent.futures
 import glob
 import http.server
@@ -28,6 +29,10 @@ IDENTIFIER_RE = re.compile(r"^iPhone(\d+),(\d+)$")
 _run_lock = threading.Lock()
 _io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="ipsw-io")
 IO_TIMEOUT = 5  # seconds before giving up on a CIFS read
+SPEED_WINDOW = 15  # seconds of .partial size samples used to work out download speed
+
+_speed_samples = {}  # .partial file name -> deque of (monotonic time, size)
+_speed_lock = threading.Lock()
 
 
 def _with_timeout(fn, *args, fallback):
@@ -77,6 +82,32 @@ def extract_version(name):
     return m.group(1) if m else "—"
 
 
+def download_speed(name, size):
+    """Bytes per second for a .partial file, from the sizes seen as the UI polls.
+
+    Samples from the last SPEED_WINDOW seconds are kept, so several open tabs
+    polling at once don't skew the figure. None until there's enough to go on.
+    """
+    now = time.monotonic()
+    with _speed_lock:
+        samples = _speed_samples.setdefault(name, collections.deque())
+        if samples and size < samples[-1][1]:
+            samples.clear()  # the file shrank: the download restarted
+        samples.append((now, size))
+        while len(samples) > 1 and now - samples[0][0] > SPEED_WINDOW:
+            samples.popleft()
+        start, start_size = samples[0]
+        if now - start < 2:
+            return None
+        return (size - start_size) / (now - start)
+
+
+def forget_speeds(active_names):
+    with _speed_lock:
+        for name in set(_speed_samples) - set(active_names):
+            del _speed_samples[name]
+
+
 def get_downloads():
     results = []
     download_path = Path(DOWNLOAD_DIR)
@@ -105,13 +136,16 @@ def get_downloads():
     except OSError:
         pass
 
+    partials = []
     try:
         for path in sorted(download_path.glob("*.ipsw.partial")):
             try:
                 stat = path.stat()
             except OSError:
                 continue
+            partials.append(path.name)
             ipsw_name = path.stem  # strips .partial, keeps .ipsw
+            speed = download_speed(path.name, stat.st_size)
             results.append(
                 {
                     "name": ipsw_name,
@@ -121,10 +155,13 @@ def get_downloads():
                     "status": "downloading",
                     "verified": False,
                     "version": extract_version(ipsw_name),
+                    "speed": speed,
+                    "speed_human": format_size(speed) + "/s" if speed is not None else None,
                 }
             )
     except OSError:
         pass
+    forget_speeds(partials)
 
     return results
 
@@ -239,6 +276,7 @@ td{padding:10px 16px;border-bottom:1px solid #21262d;vertical-align:middle}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:rgba(255,255,255,.025)}
 .mono{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:12px}
+.speed{display:block;color:#58a6ff;font-size:11px;margin-top:2px}
 .badge{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap}
 .badge-green{background:rgba(63,185,80,.13);color:#3fb950}
 .badge-blue{background:rgba(88,166,255,.13);color:#58a6ff;animation:pulse 1.5s ease-in-out infinite}
@@ -364,7 +402,7 @@ async function refresh() {
       return '<tr>'
         + '<td class="mono">' + f.name + '</td>'
         + '<td>' + (f.version !== "—" ? 'iOS ' + f.version : f.version) + '</td>'
-        + '<td class="mono">' + f.size_human + '</td>'
+        + '<td class="mono">' + f.size_human + speedLabel(f) + '</td>'
         + '<td style="color:#8b949e">' + fmt(f.mtime) + '</td>'
         + '<td>' + badge + '</td>'
         + '</tr>';
@@ -379,6 +417,11 @@ async function refresh() {
   if (d.last_run) {
     document.getElementById("last-run-text").textContent = "Last run: " + d.last_run.replace(/^[^Z]+Z\\s+/, "");
   }
+}
+
+function speedLabel(f) {
+  if (f.status !== "downloading") return "";
+  return '<span class="speed">' + (f.speed_human || "measuring…") + '</span>';
 }
 
 async function doRun(clearCache) {
