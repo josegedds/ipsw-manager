@@ -26,34 +26,52 @@ The selection is saved to `selected-devices.json` in the download folder. Until 
 
 ```bash
 docker run -d --name ipsw-manager \
+  --restart unless-stopped \
   -p 8080:8080 \
+  -e PUID=1000 -e PGID=1000 \
+  -e TZ=Europe/London \
   -v /path/to/ipsw:/downloads \
   josephgeddes/ipsw-manager:latest
 ```
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `CRON_SCHEDULE` | `0 18 * * *` | When to run (cron syntax, in `TZ`) |
+| `TZ` | `UTC` | Time zone for the schedule, e.g. `Europe/London` |
+| `PUID` / `PGID` | unset (root) | User and group to run as, so files on the NAS aren't owned by root. `PGID` defaults to `PUID` |
 | `IPSW_DOWNLOAD_DIR` | `/downloads` | Where IPSWs, the log and the selection are stored |
 | `IPSW_CHECKSUM_ALGO` | `md5` | `md5` or `sha256` |
 | `IPSW_SELECTION_FILE` | `$IPSW_DOWNLOAD_DIR/selected-devices.json` | Saved phone selection |
 | `IPSW_HASH_CACHE_DIR` | `$IPSW_DOWNLOAD_DIR/.hash-cache` | Cache of verified checksums |
-| `CRON_SCHEDULE` | `0 18 * * *` | When to run (cron syntax, UTC) |
 | `WEBUI_PORT` | `8080` | Web UI port |
 
-The schedule uses cron syntax, read by [supercronic](https://github.com/aptible/supercronic), and the container runs in UTC. To run at 06:00 instead:
+The schedule is read by [supercronic](https://github.com/aptible/supercronic). The log's timestamps are always in UTC.
+
+**Running as a user.** With `PUID` set, the download folder must be writable by that user; the container warns at startup if it isn't. If you previously ran as root, fix the existing files once on the host:
 
 ```bash
-docker run -d --name ipsw-manager \
-  -p 8080:8080 \
-  -e CRON_SCHEDULE="0 6 * * *" \
-  -v /path/to/ipsw:/downloads \
-  josephgeddes/ipsw-manager:latest
+sudo chown -R 1000:1000 /path/to/ipsw
 ```
+
+**Restarts and health.** If the web UI or the scheduler stops, the container exits so `--restart unless-stopped` brings it back. A health check polls the web UI every minute, and `docker ps` shows the result.
+
+**Access.** The web UI has no login, and anyone who can reach it can start runs and change the phone list. To make it reachable only from the host itself, publish the port on localhost: `-p 127.0.0.1:8080:8080`.
+
+**If ipsw.me is unreachable.** Lookups are retried. If any phone's lookup still fails, that run downloads what it can but skips the cleanup, so that phone's IPSW isn't deleted.
 
 ## Releasing a new version
 
+Build for Intel and ARM (most NAS boxes are one or the other) and push in one step:
+
 ```bash
-docker build -t josephgeddes/ipsw-manager:1.2 -t josephgeddes/ipsw-manager:latest .
-docker push josephgeddes/ipsw-manager:1.2
-docker push josephgeddes/ipsw-manager:latest
+docker buildx build --platform linux/amd64,linux/arm64 \
+  --build-arg VERSION=1.2 \
+  -t josephgeddes/ipsw-manager:1.2 -t josephgeddes/ipsw-manager:latest \
+  --push .
+```
+
+The base image is pinned by digest in the `Dockerfile`. To move to a newer Alpine, update both the tag and the digest:
+
+```bash
+docker buildx imagetools inspect alpine:3.24 --format '{{json .Manifest.Digest}}'
 ```

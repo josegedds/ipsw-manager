@@ -2,6 +2,16 @@
 
 set -euo pipefail
 
+# With PUID set (see entrypoint.sh), a `docker exec` run as root switches to
+# that user too, so it doesn't leave root-owned files on the NAS.
+if [[ -n "${PUID:-}" && "$PUID" != 0 && $(id -u) -eq 0 ]] && command -v su-exec &>/dev/null; then
+  exec su-exec "${PUID}:${PGID:-$PUID}" "$0" "$@"
+fi
+
+# `docker exec` starts processes with umask 0000, which would leave the log
+# and hash cache world-writable. Any other umask is left as the user set it.
+[[ "$(umask)" == "0000" ]] && umask 022
+
 # Environment variables — all have sensible defaults so the script
 # works both inside Docker and standalone.
 DOWNLOAD_DIR="${IPSW_DOWNLOAD_DIR:-$PWD/ipsw}"
@@ -42,7 +52,7 @@ fi
 
 if (( ${#DEVICES[@]} == 0 )); then
   log "📡 No saved selection — fetching device list (iPhone 11 and newer)..."
-  DEVICES=($(curl -s "$API_DEVICES" | jq -r '
+  DEVICES=($(curl -sS --fail --retry 3 --retry-delay 5 --max-time 60 "$API_DEVICES" | jq -r '
     .[]
     | select(.identifier | startswith("iPhone"))
     | select(.identifier | capture("iPhone(?<num>[0-9]+),").num | tonumber >= 12)
@@ -75,7 +85,13 @@ fetch_meta() {
   local OUT="$META_DIR/$DEVICE"
 
   local JSON
-  JSON=$(curl -s "$API_BASE/$DEVICE?type=ipsw")
+  # A failed lookup is recorded as $OUT.failed so the cleanup step knows the
+  # device's current IPSW is unknown, rather than no longer needed.
+  if ! JSON=$(curl -sS --fail --retry 3 --retry-delay 5 --max-time 60 "$API_BASE/$DEVICE?type=ipsw"); then
+    echo "⚠️  $DEVICE: Couldn't fetch firmware list from ipsw.me"
+    touch "$OUT.failed"
+    return
+  fi
 
   # Extract the latest signed non-beta firmware entry as a compact JSON object
   echo "$JSON" | jq -c '
@@ -87,7 +103,7 @@ fetch_meta() {
     | if . == null then null
       else { url, version, md5sum, sha256sum, filesize: (.filesize // 0) }
       end
-  ' > "$OUT"
+  ' > "$OUT" || { echo "⚠️  $DEVICE: Unreadable reply from ipsw.me"; rm -f "$OUT"; touch "$OUT.failed"; }
 }
 
 export -f fetch_meta
@@ -373,6 +389,12 @@ for URL in "${!URL_DEVICES[@]}"; do
     "${URL_SIZE[$URL]}" \
     "${URL_DEVICES[$URL]}"
 done
+
+FAILED=("$META_DIR"/*.failed)
+if [[ -e "${FAILED[0]}" ]]; then
+  log "⚠️  Firmware lookup failed for ${#FAILED[@]} phone(s) — skipping cleanup so their IPSWs aren't deleted."
+  exit 1
+fi
 
 log "🧹 Cleaning up old IPSWs..."
 
