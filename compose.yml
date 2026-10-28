@@ -1,0 +1,25 @@
+# Example Docker Compose setup for ipsw-manager.
+# Edit the volume path and settings below, then run: docker compose up -d
+services:
+  ipsw-manager:
+    image: josephgeddes/ipsw-manager:latest
+    # To build from this checkout instead of pulling, uncomment:
+    # build: .
+    container_name: ipsw-manager
+    restart: unless-stopped
+    ports:
+      # Use "127.0.0.1:8080:8080" to reach the web UI from this host only.
+      - "8080:8080"
+    environment:
+      # When to run, in cron syntax, in the time zone below.
+      CRON_SCHEDULE: "0 18 * * *"
+      TZ: Europe/London
+      # Run as this user and group so files on the NAS aren't owned by root.
+      # The download folder must be writable by them. Remove both to run as root.
+      PUID: "1000"
+      PGID: "1000"
+      # md5 or sha256
+      IPSW_CHECKSUM_ALGO: md5
+    volumes:
+      # Where the IPSWs, the log and the phone selection are kept.
+      - /path/to/ipsw:/downloads

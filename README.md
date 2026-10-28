@@ -34,6 +34,8 @@ docker run -d --name ipsw-manager \
   josephgeddes/ipsw-manager:latest
 ```
 
+Or with Docker Compose: edit the volume path and settings in [`compose.yml`](compose.yml), then run `docker compose up -d`.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CRON_SCHEDULE` | `0 18 * * *` | When to run (cron syntax, in `TZ`) |
