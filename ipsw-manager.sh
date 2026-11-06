@@ -8,6 +8,16 @@ if [[ -n "${PUID:-}" && "$PUID" != 0 && $(id -u) -eq 0 ]] && command -v su-exec 
   exec su-exec "${PUID}:${PGID:-$PUID}" "$0" "$@"
 fi
 
+# Stop the whole run if it takes longer than this. A NAS that hangs (rather
+# than erroring) would otherwise freeze the run, and with it every later one,
+# since they'd all be skipped as "already in progress". timeout signals the
+# whole process group, so curl and tee go too. 0 turns it off.
+RUN_TIMEOUT="${IPSW_RUN_TIMEOUT:-12h}"
+if [[ -z "${_IPSW_WATCHDOG:-}" && "$RUN_TIMEOUT" != 0 ]] && command -v timeout &>/dev/null; then
+  export _IPSW_WATCHDOG=1
+  exec timeout -k 60 "$RUN_TIMEOUT" "$BASH" "$0" "$@"
+fi
+
 # `docker exec` starts processes with umask 0000, which would leave the log
 # and hash cache world-writable. Any other umask is left as the user set it.
 [[ "$(umask)" == "0000" ]] && umask 022
@@ -24,25 +34,133 @@ LOG_FILE="${DOWNLOAD_DIR}/ipsw-manager.log"
 SELECTION_FILE="${IPSW_SELECTION_FILE:-${DOWNLOAD_DIR}/selected-devices.json}"
 # Hash cache — avoids re-reading whole IPSWs from the NAS on later runs.
 # Kept next to the downloads by default so it survives container updates.
-# Stored as <filename>.hash, one line: "<algo> <hash>"
+# Stored as <filename>.hash, one line: "<algo> <hash> <size in bytes>"
 HASH_CACHE_DIR="${IPSW_HASH_CACHE_DIR:-${DOWNLOAD_DIR}/.hash-cache}"
-mkdir -p "$DOWNLOAD_DIR" "$HASH_CACHE_DIR"
+# Marks the download folder as the real one (see check_download_dir).
+MARKER_FILE="${DOWNLOAD_DIR}/.ipsw-manager"
+
+# Kept inside the container, not on the NAS, so they still work when the
+# NAS doesn't. The web UI reads the last two.
+STATE_DIR="${TMPDIR:-/tmp}"
+SEEN_MARKER_FILE="${STATE_DIR}/ipsw-manager-seen-marker"   # we've seen the marker before
+LAST_RUN_FILE="${STATE_DIR}/ipsw-manager-last-run"         # outcome of the last run
+RUN_STARTED_FILE="${STATE_DIR}/ipsw-manager-run-started"   # removed when a run ends
+
+timestamp() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 
 log() {
   local MSG="$1"
-  printf "%s  %s\n" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$MSG" | tee -a "$LOG_FILE"
+  printf "%s  %s\n" "$(timestamp)" "$MSG" | tee -a "$LOG_FILE"
 }
+
+# ---------------------------------------------------------------------------
+# Ending a run. Every run that gets past the lock records a one-line outcome
+# in $LAST_RUN_FILE. If the script dies part-way (set -e, usually because
+# the NAS stopped answering) the outcome says where, and goes to stderr too,
+# since the log on the NAS may be unreachable.
+# ---------------------------------------------------------------------------
+
+RESULT=""          # one-line outcome, set by finish()
+ABORTED_AT=""      # set by the ERR trap: the command that failed
+LOG_READY=0        # the download folder checked out, so the log may be written
+CURRENT_PARTIAL="" # .partial being written, removed if the run dies
+POLLER_PID=""
+
+finish() {
+  local STATUS="$1"
+  RESULT="$2"
+  log "$RESULT"
+  exit "$STATUS"
+}
+
+on_exit() {
+  local STATUS=$?
+  set +e        # finish cleaning up whatever fails here
+  trap - ERR
+  [[ -n "$POLLER_PID" ]] && kill "$POLLER_PID" 2>/dev/null
+  rm -f "${TMP_FILE:-}" "${PROGRESS_FILE:-}" "${CURL_ERR:-}"
+  [[ -n "${META_DIR:-}" ]] && rm -rf "$META_DIR"
+
+  if [[ -n "$ABORTED_AT" ]]; then
+    RESULT="❌ Run aborted (status $STATUS) — $ABORTED_AT"
+    printf "%s  %s\n" "$(timestamp)" "$RESULT" >&2
+    # Best effort, in the background, so a hung NAS can't hang the exit.
+    # fd 9 is the run lock; closing it stops a stuck write from holding it.
+    if (( LOG_READY )); then
+      {
+        [[ -n "$CURRENT_PARTIAL" ]] && rm -f "$CURRENT_PARTIAL"
+        printf "%s  %s\n" "$(timestamp)" "$RESULT" >> "$LOG_FILE"
+      } </dev/null >/dev/null 2>&1 9>&- &
+    fi
+  fi
+
+  if [[ -n "$RESULT" ]]; then
+    printf "%s  %s\n" "$(timestamp)" "$RESULT" > "$LAST_RUN_FILE" 2>/dev/null || true
+    rm -f "$RUN_STARTED_FILE"
+  fi
+}
+
+on_err() { ABORTED_AT="line $1: $2. Is the download folder reachable?"; }
+
+on_signal() {
+  ABORTED_AT="stopped by $1 (timed out after ${RUN_TIMEOUT}, or the container is stopping)"
+  exit 143
+}
+
+set -E   # run the ERR trap inside functions too
+trap 'on_err "$LINENO" "$BASH_COMMAND"' ERR
+trap 'on_signal SIGTERM' TERM
+trap 'on_signal SIGINT' INT
+trap on_exit EXIT
+
+# ---------------------------------------------------------------------------
+# Make sure the download folder is the real one. If the NAS isn't mounted
+# when the container starts, Docker binds the empty folder underneath, and
+# the run would fill the host's disk with IPSWs that vanish once the NAS
+# is back. A marker file in the folder tells the two apart.
+# ---------------------------------------------------------------------------
+
+check_download_dir() {
+  if [[ ! -f "$MARKER_FILE" ]]; then
+    if compgen -G "$DOWNLOAD_DIR/*.ipsw" >/dev/null \
+      || compgen -G "$HASH_CACHE_DIR/*.hash" >/dev/null \
+      || [[ -f "$LOG_FILE" ]]; then
+      :  # Set up before the marker existed — adopt it.
+    elif [[ -e "$SEEN_MARKER_FILE" ]]; then
+      # Empty, but this container has used a marked folder before.
+      RESULT="❌ ${DOWNLOAD_DIR} is empty and missing its .ipsw-manager marker — is the NAS mounted? Nothing was changed."
+      printf "%s  %s\n" "$(timestamp)" "$RESULT" >&2
+      echo "   If this really is a new, empty folder, create the marker and run again:" >&2
+      echo "   touch ${MARKER_FILE}" >&2
+      exit 1
+    fi
+    # Otherwise a first run into a new folder.
+    mkdir -p "$DOWNLOAD_DIR"
+    printf '%s\n' \
+      "This folder is managed by ipsw-manager. Keep this file: it tells" \
+      "ipsw-manager the folder (or the NAS it's on) is really there." > "$MARKER_FILE"
+  fi
+  touch "$SEEN_MARKER_FILE" 2>/dev/null || true
+}
+
+check_download_dir
+mkdir -p "$HASH_CACHE_DIR"
+LOG_READY=1
 
 # Only one run at a time: the schedule and the web UI's Run Now would
 # otherwise download into the same .partial files and both clean up.
 # The lock is local (not on the NAS), where flock is reliable.
 if command -v flock &>/dev/null; then
-  exec 9>"${TMPDIR:-/tmp}/ipsw-manager.lock"
+  exec 9>"${STATE_DIR}/ipsw-manager.lock"
   if ! flock -n 9; then
     log "⏭  Another run is already in progress — skipping this one."
     exit 0
   fi
 fi
+
+# Left behind only if this run is killed outright. The web UI then reports
+# that the run didn't finish.
+timestamp > "$RUN_STARTED_FILE"
 
 DEVICES=()
 if [[ -s "$SELECTION_FILE" ]]; then
@@ -62,8 +180,7 @@ fi
 
 # Without a device list the cleanup step below would delete every IPSW.
 if (( ${#DEVICES[@]} == 0 )); then
-  log "❌ No devices to check (ipsw.me unreachable?) — stopping without changes."
-  exit 1
+  finish 1 "❌ No devices to check (ipsw.me unreachable?) — stopping without changes."
 fi
 
 log "📱 Checking ${#DEVICES[@]} iPhone devices — fetching firmware metadata..."
@@ -81,7 +198,6 @@ TMP_FILE=$(mktemp)
 # Name and expected size of the file being downloaded, so the web UI can
 # show a percentage and time remaining. Inside the container, not on the NAS.
 PROGRESS_FILE="${TMPDIR:-/tmp}/ipsw-manager-download"
-trap "rm -f $TMP_FILE $PROGRESS_FILE; rm -rf $META_DIR" EXIT
 
 fetch_meta() {
   local DEVICE="$1"
@@ -179,8 +295,7 @@ log "🗂  Deduplicated to $UNIQUE_COUNT unique firmware files (from ${#DEVICES[
 # Nothing signed found usually means the API calls failed — don't let the
 # cleanup step wipe the download folder on that basis.
 if (( UNIQUE_COUNT == 0 )); then
-  log "⚠️  No signed firmware found for the selected phones — skipping download and cleanup."
-  exit 0
+  finish 0 "⚠️  No signed firmware found for the selected phones — skipping download and cleanup."
 fi
 
 # Phase 2: verify / download each unique URL one at a time.
@@ -263,6 +378,32 @@ draw_progress() {
     "$LABEL" "$VERSION" "$BAR" "$PCT_DISPLAY" "$SIZE_INFO"
 }
 
+file_size() {
+  if stat --version &>/dev/null; then
+    stat -c '%s' "$1"
+  else
+    stat -f '%z' "$1"   # macOS
+  fi
+}
+
+# A download that fails keeps the phone's current IPSW: any failure skips
+# the cleanup step, which would otherwise delete it.
+DOWNLOAD_FAILURES=0
+
+download_failed() {
+  local LABEL="$1" VERSION="$2" REASON="$3"
+  rm -f "$CURRENT_PARTIAL"
+  CURRENT_PARTIAL=""
+  (( DOWNLOAD_FAILURES++ )) || true
+  printf "❌ [%s]: %s (iOS %s)\n" "$LABEL" "$REASON" "$VERSION"
+  printf "%s  ❌ [%s]: %s (iOS %s)\n" "$(timestamp)" "$LABEL" "$REASON" "$VERSION" >> "$LOG_FILE"
+}
+
+# Give up on a download that slows to under 1 KB/s for two minutes, rather
+# than waiting forever on a stalled connection.
+CURL_DOWNLOAD_OPTS=(-L --fail --silent --show-error --connect-timeout 30
+  --speed-limit 1024 --speed-time 120)
+
 download_unique() {
   local URL="$1"
   local VERSION="$2"
@@ -281,39 +422,48 @@ download_unique() {
   local CACHE_FILE="$HASH_CACHE_DIR/${FILE_NAME}.hash"
 
   if [[ -f "$FILE_PATH" ]]; then
-    # Check the local cache first — avoids reading the file from the NAS entirely.
-    # Cache entry format: "<algo> <hash>"
+    # Check the cache first — avoids reading the whole file back from the NAS.
+    # Cache entry format: "<algo> <hash> <size>". The hash is "-" when there
+    # was none to check, and entries from older versions have no size.
     if [[ -f "$CACHE_FILE" ]]; then
-      local CACHED_ALGO CACHED_HASH
-      read -r CACHED_ALGO CACHED_HASH < "$CACHE_FILE"
-      if [[ "$CACHED_ALGO" == "$HASH_ALGO" && "$CACHED_HASH" == "$EXPECTED_HASH" ]]; then
-        printf "✅ [%s]: Already verified via cache (iOS %s)\n" "$LABEL" "$VERSION"
-        printf "%s  ✅ [%s]: Already verified via cache (iOS %s)\n" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$LABEL" "$VERSION" >> "$LOG_FILE"
-        return
+      local CACHED_ALGO CACHED_HASH CACHED_SIZE ON_DISK
+      read -r CACHED_ALGO CACHED_HASH CACHED_SIZE < "$CACHE_FILE"
+      if [[ "$CACHED_ALGO" == "$HASH_ALGO" && "${CACHED_HASH:--}" == "${EXPECTED_HASH:--}" ]]; then
+        # A size check is cheap and catches a file that was cut short on the NAS.
+        ON_DISK=$(file_size "$FILE_PATH")
+        if [[ -z "$CACHED_SIZE" ]]; then
+          printf "%s %s %s\n" "$HASH_ALGO" "${EXPECTED_HASH:--}" "$ON_DISK" > "$CACHE_FILE"
+          CACHED_SIZE="$ON_DISK"
+        fi
+        if [[ "$ON_DISK" == "$CACHED_SIZE" ]]; then
+          printf "✅ [%s]: Already verified via cache (iOS %s)\n" "$LABEL" "$VERSION"
+          printf "%s  ✅ [%s]: Already verified via cache (iOS %s)\n" "$(timestamp)" "$LABEL" "$VERSION" >> "$LOG_FILE"
+          return
+        fi
+        printf "⚠️  [%s]: %s is %s bytes but was %s when verified — re-downloading\n" \
+          "$LABEL" "$FILE_NAME" "$ON_DISK" "$CACHED_SIZE"
+        printf "%s  ⚠️  [%s]: %s changed size since it was verified — re-downloading\n" \
+          "$(timestamp)" "$LABEL" "$FILE_NAME" >> "$LOG_FILE"
       fi
     fi
     # No valid cache entry — file exists but we haven't seen it before
     # (e.g. first run after an upgrade, or cache was cleared).
     # Re-download rather than reading the whole file back from the NAS.
-    printf "🔄 [%s]: No cache entry — re-downloading iOS %s\n" "$LABEL" "$VERSION"
+    printf "🔄 [%s]: No valid cache entry — re-downloading iOS %s\n" "$LABEL" "$VERSION"
     rm -f "$FILE_PATH" "$CACHE_FILE"
   fi
+
+  CURRENT_PARTIAL="$PARTIAL_PATH"
 
   # Spawn a background poller that redraws the progress line every 0.5s by
   # reading the .partial file size. Killed as soon as curl exits.
   (
     while true; do
       sleep 0.5
-      local DOWNLOADED=0
-      if stat --version &>/dev/null 2>&1; then
-        DOWNLOADED=$(stat -c '%s' "$PARTIAL_PATH" 2>/dev/null || echo 0)
-      else
-        DOWNLOADED=$(stat -f '%z' "$PARTIAL_PATH" 2>/dev/null || echo 0)
-      fi
-      draw_progress "$LABEL" "$VERSION" "$DOWNLOADED" "$FILESIZE"
+      draw_progress "$LABEL" "$VERSION" "$(file_size "$PARTIAL_PATH" 2>/dev/null || echo 0)" "$FILESIZE"
     done
   ) &
-  local POLLER_PID=$!
+  POLLER_PID=$!
 
   draw_progress "$LABEL" "$VERSION" 0 "$FILESIZE"
   printf '%s\n%s\n' "$FILE_NAME" "$FILESIZE" > "$PROGRESS_FILE"
@@ -331,24 +481,38 @@ download_unique() {
 
   local CURL_OK=0
   local ACTUAL_HASH=""
+  # curl writes the number of bytes it received as the last line of its
+  # stderr, so the file on the NAS can be checked against it.
+  CURL_ERR=$(mktemp)   # global, so on_exit can remove it
 
   if [[ -n "$HASH_CMD" && -n "$EXPECTED_HASH" && "$EXPECTED_HASH" != "null" ]]; then
-    ACTUAL_HASH=$(set -o pipefail; curl -L --fail --silent --show-error "$URL" \
-  | tee "$PARTIAL_PATH" \
-  | $HASH_CMD \
-  | awk '{print $1}') || CURL_OK=$?
+    # tee keeps passing data on after a failed write, so the hash can still
+    # match; pipefail makes the write failure fail the download.
+    ACTUAL_HASH=$(set -o pipefail; curl "${CURL_DOWNLOAD_OPTS[@]}" \
+        --write-out '%{stderr}%{size_download}\n' "$URL" 2>"$CURL_ERR" \
+      | tee "$PARTIAL_PATH" \
+      | $HASH_CMD \
+      | awk '{print $1}') || CURL_OK=$?
   else
-    curl -L --fail --silent --show-error -o "$PARTIAL_PATH" "$URL" 2>&1 || CURL_OK=$?
+    curl "${CURL_DOWNLOAD_OPTS[@]}" --write-out '%{stderr}%{size_download}\n' \
+      -o "$PARTIAL_PATH" "$URL" 2>"$CURL_ERR" || CURL_OK=$?
   fi
 
   kill "$POLLER_PID" 2>/dev/null
   wait "$POLLER_PID" 2>/dev/null || true
+  POLLER_PID=""
   rm -f "$PROGRESS_FILE"
 
+  local RECEIVED CURL_MSG
+  RECEIVED=$(tail -n 1 "$CURL_ERR")
+  CURL_MSG=$(sed '$d' "$CURL_ERR")   # curl's own error message, if any
+  rm -f "$CURL_ERR"
+  CURL_ERR=""
+
   if (( CURL_OK != 0 )); then
-    rm -f "$PARTIAL_PATH"
-    printf "\n❌ [%s]: Download failed for iOS %s\n" "$LABEL" "$VERSION"
-    printf "%s  ❌ [%s]: Download failed (iOS %s)\n" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$LABEL" "$VERSION" >> "$LOG_FILE"
+    printf "\n"
+    [[ -n "$CURL_MSG" ]] && printf "%s\n" "$CURL_MSG" >&2
+    download_failed "$LABEL" "$VERSION" "Download failed, or couldn't write it to the download folder (status $CURL_OK)"
     return
   fi
 
@@ -356,32 +520,37 @@ download_unique() {
   printf "\n"
 
   # Verify the hash captured inline during download — no second read needed.
-  local VERIFIED=0
-  if [[ -n "$ACTUAL_HASH" && -n "$EXPECTED_HASH" && "$EXPECTED_HASH" != "null" ]]; then
-    if [[ "$ACTUAL_HASH" == "$EXPECTED_HASH" ]]; then
-      VERIFIED=1
-    else
-      printf "❌ [%s]: Checksum mismatch (%s)\n" "$LABEL" "$HASH_ALGO"
-      printf "   Expected: %s\n" "$EXPECTED_HASH"
-      printf "   Got:      %s\n" "$ACTUAL_HASH"
-    fi
-  else
-    # No hash available — accept the file as-is
-    VERIFIED=1
+  if [[ -n "$ACTUAL_HASH" && -n "$EXPECTED_HASH" && "$EXPECTED_HASH" != "null" \
+        && "$ACTUAL_HASH" != "$EXPECTED_HASH" ]]; then
+    printf "   Expected: %s\n" "$EXPECTED_HASH"
+    printf "   Got:      %s\n" "$ACTUAL_HASH"
+    download_failed "$LABEL" "$VERSION" "Checksum mismatch ($HASH_ALGO) — file removed, will retry next run"
+    return
   fi
 
-  if (( VERIFIED )); then
-    mv "$PARTIAL_PATH" "$FILE_PATH"
-    # Cache the hash so future runs skip re-reading from the NAS
-    printf "%s %s\n" "$HASH_ALGO" "$ACTUAL_HASH" > "$CACHE_FILE"
-    printf "✅ [%s]: iOS %s downloaded and verified\n" "$LABEL" "$VERSION"
-    printf "%s  ✅ [%s]: iOS %s downloaded and verified\n" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$LABEL" "$VERSION" >> "$LOG_FILE"
-  else
-    rm -f "$PARTIAL_PATH"
-    printf "❌ [%s]: Checksum failed — file removed. Will retry next run.\n" "$LABEL"
-    printf "%s  ❌ [%s]: Checksum failed (iOS %s)\n" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$LABEL" "$VERSION" >> "$LOG_FILE"
+  # The hash only covers what curl received. Flush the file to the NAS and
+  # check all of it arrived, so a write the NAS lost isn't cached as verified.
+  if ! sync "$PARTIAL_PATH"; then
+    download_failed "$LABEL" "$VERSION" "Couldn't write the file to the download folder"
+    return
   fi
+  local ON_DISK
+  ON_DISK=$(file_size "$PARTIAL_PATH")
+  if [[ "$ON_DISK" != "$RECEIVED" ]]; then
+    download_failed "$LABEL" "$VERSION" "Saved file is $ON_DISK bytes but $RECEIVED were downloaded"
+    return
+  fi
+
+  mv "$PARTIAL_PATH" "$FILE_PATH"
+  CURRENT_PARTIAL=""
+  # Cache the hash and size so future runs skip re-reading from the NAS
+  printf "%s %s %s\n" "$HASH_ALGO" "${ACTUAL_HASH:--}" "$ON_DISK" > "$CACHE_FILE"
+  printf "✅ [%s]: iOS %s downloaded and verified\n" "$LABEL" "$VERSION"
+  printf "%s  ✅ [%s]: iOS %s downloaded and verified\n" "$(timestamp)" "$LABEL" "$VERSION" >> "$LOG_FILE"
 }
+
+# We hold the lock, so any .partial is left over from a run that was killed.
+rm -f "$DOWNLOAD_DIR"/*.ipsw.partial
 
 log "🚀 Downloading $UNIQUE_COUNT firmware files sequentially..."
 
@@ -397,8 +566,11 @@ done
 
 FAILED=("$META_DIR"/*.failed)
 if [[ -e "${FAILED[0]}" ]]; then
-  log "⚠️  Firmware lookup failed for ${#FAILED[@]} phone(s) — skipping cleanup so their IPSWs aren't deleted."
-  exit 1
+  finish 1 "⚠️  Firmware lookup failed for ${#FAILED[@]} phone(s) — skipping cleanup so their IPSWs aren't deleted."
+fi
+
+if (( DOWNLOAD_FAILURES > 0 )); then
+  finish 1 "⚠️  ${DOWNLOAD_FAILURES} download(s) failed — skipping cleanup so those phones keep their current IPSWs."
 fi
 
 log "🧹 Cleaning up old IPSWs..."
@@ -416,4 +588,4 @@ for FILE in "$DOWNLOAD_DIR"/*.ipsw; do
   fi
 done
 
-log "✅ Done — ${#KEEP_FILES[@]} file(s) retained, $REMOVED removed."
+finish 0 "✅ Done — ${#KEEP_FILES[@]} file(s) retained, $REMOVED removed."

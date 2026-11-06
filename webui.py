@@ -27,23 +27,45 @@ DEVICE_CACHE_TTL = 3600  # seconds to keep the ipsw.me device list in memory
 IDENTIFIER_RE = re.compile(r"^iPhone(\d+),(\d+)$")
 
 _run_lock = threading.Lock()
-_io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="ipsw-io")
-IO_TIMEOUT = 5  # seconds before giving up on a CIFS read
+_io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="ipsw-io")
+IO_TIMEOUT = 5  # seconds before giving up on a NAS read
+_io_pending = {}  # function name -> Future still stuck on the NAS
+_io_pending_lock = threading.Lock()
 SPEED_WINDOW = 15  # seconds of .partial size samples used to work out download speed
 # Written by ipsw-manager.sh while it downloads: file name, then expected bytes.
-PROGRESS_FILE = os.path.join(os.environ.get("TMPDIR", "/tmp"), "ipsw-manager-download")
+STATE_DIR = os.environ.get("TMPDIR", "/tmp")
+PROGRESS_FILE = os.path.join(STATE_DIR, "ipsw-manager-download")
+# Also written by ipsw-manager.sh, inside the container so they're readable
+# when the NAS isn't: the last run's outcome, and the start time of a run
+# that hasn't finished (left behind if it was killed).
+LAST_RUN_FILE = os.path.join(STATE_DIR, "ipsw-manager-last-run")
+RUN_STARTED_FILE = os.path.join(STATE_DIR, "ipsw-manager-run-started")
+# Log lines that end a run, for when LAST_RUN_FILE doesn't exist yet.
+RUN_END_MARKERS = ("✅ Done", "Run aborted", "skipping cleanup", "stopping without changes",
+                   "skipping download and cleanup", "is the NAS mounted")
 
 _speed_samples = {}  # .partial file name -> deque of (monotonic time, size)
 _speed_lock = threading.Lock()
 
 
 def _with_timeout(fn, *args, fallback):
-    """Run fn(*args) in a thread pool; return fallback if it doesn't finish in IO_TIMEOUT seconds."""
-    future = _io_executor.submit(fn, *args)
+    """Run fn(*args) in a thread pool; return fallback if it doesn't finish in IO_TIMEOUT seconds.
+
+    A call stuck on a hung mount keeps its worker thread until the mount
+    answers. While one is stuck, later calls to the same function return
+    fallback straight away instead of tying up another worker.
+    """
+    name = fn.__name__
+    with _io_pending_lock:
+        stuck = _io_pending.get(name)
+        if stuck is not None and not stuck.done():
+            return fallback
+        future = _io_executor.submit(fn, *args)
+        _io_pending[name] = future
     try:
         return future.result(timeout=IO_TIMEOUT)
     except concurrent.futures.TimeoutError:
-        print(f"WARN: {fn.__name__} timed out — CIFS mount may be unavailable", flush=True)
+        print(f"WARN: {name} timed out — the download folder's mount may be unavailable", flush=True)
         return fallback
 
 
@@ -61,6 +83,24 @@ def is_manager_running():
         except OSError:
             pass
     return False
+
+
+def get_last_run(logs, running):
+    """One line describing how the last run ended, or None."""
+    if not running:
+        try:
+            started = Path(RUN_STARTED_FILE).read_text(encoding="utf-8").strip()
+            return f"{started}  ❌ Run stopped before finishing (killed or timed out)"
+        except OSError:
+            pass
+    try:
+        return Path(LAST_RUN_FILE).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        pass
+    for line in reversed(logs):
+        if any(marker in line for marker in RUN_END_MARKERS):
+            return line.strip()
+    return None
 
 
 def get_log_tail(n=200):
@@ -619,11 +659,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             running = is_manager_running()
             downloads = _with_timeout(get_downloads, fallback=[])
             logs = _with_timeout(get_log_tail, 200, fallback=["[log unavailable — mount may be offline]"])
-            last_run = None
-            for line in reversed(logs):
-                if "Done" in line and ("retained" in line or "removed" in line):
-                    last_run = line.strip()
-                    break
+            last_run = get_last_run(logs, running)
             self.send_json(
                 {
                     "running": running,
@@ -672,9 +708,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"success": False, "message": "Select at least one phone"}, status=400)
                 return
             try:
-                write_selection(set(selected))
+                saved = _with_timeout(write_selection, set(selected), fallback=False)
             except OSError as exc:
                 self.send_json({"success": False, "message": f"Couldn't save: {exc}"}, status=500)
+                return
+            if saved is False:
+                self.send_json(
+                    {"success": False, "message": "Couldn't save: the download folder isn't responding"},
+                    status=503,
+                )
                 return
             self.send_json({"success": True, "message": f"Saved {len(set(selected))} phones"})
         else:

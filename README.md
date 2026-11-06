@@ -8,7 +8,7 @@ Docker image: [`josephgeddes/ipsw-manager`](https://hub.docker.com/r/josephgedde
 
 - On a cron schedule (default: every day at 18:00 GMT), `ipsw-manager.sh` asks [ipsw.me](https://ipsw.me) for the latest signed, non-beta firmware for each selected iPhone.
 - Phones that share a firmware file are de-duplicated, so each IPSW downloads once.
-- Each download is checked against its MD5 or SHA-256 checksum. Verified hashes are cached (in `.hash-cache/` in the download folder) so later runs don't re-read the files.
+- Each download is checked against its MD5 or SHA-256 checksum, and the saved file is checked to be complete. Verified hashes and sizes are cached (in `.hash-cache/` in the download folder) so later runs don't re-read the files. A file whose size has changed since it was verified is downloaded again.
 - Only one run happens at a time; a scheduled run that starts while another is going is skipped.
 - IPSWs that are no longer current, or belong to phones you've unticked, are deleted.
 
@@ -45,6 +45,7 @@ Or with Docker Compose: edit the volume path and settings in [`compose.yml`](com
 | `IPSW_CHECKSUM_ALGO` | `md5` | `md5` or `sha256` |
 | `IPSW_SELECTION_FILE` | `$IPSW_DOWNLOAD_DIR/selected-devices.json` | Saved phone selection |
 | `IPSW_HASH_CACHE_DIR` | `$IPSW_DOWNLOAD_DIR/.hash-cache` | Cache of verified checksums |
+| `IPSW_RUN_TIMEOUT` | `12h` | Stop a run that takes longer than this (`timeout` syntax, e.g. `90m`). `0` turns it off |
 | `WEBUI_PORT` | `8080` | Web UI port |
 
 The schedule is read by [supercronic](https://github.com/aptible/supercronic). The log's timestamps are always in UTC.
@@ -60,6 +61,18 @@ sudo chown -R 1000:1000 /path/to/ipsw
 **Access.** The web UI has no login, and anyone who can reach it can start runs and change the phone list. To make it reachable only from the host itself, publish the port on localhost: `-p 127.0.0.1:8080:8080`.
 
 **If ipsw.me is unreachable.** Lookups are retried. If any phone's lookup still fails, that run downloads what it can but skips the cleanup, so that phone's IPSW isn't deleted.
+
+**If a download fails.** The run carries on with the other phones but skips the cleanup, so a phone whose new firmware didn't download keeps its current IPSW. A download that stalls (under 1 KB/s for two minutes) is abandoned. The next run tries again.
+
+**If the NAS goes offline.** A run that can't write to the download folder stops without deleting anything. A run that hangs on it is stopped after `IPSW_RUN_TIMEOUT`, so later runs aren't blocked behind it. Either way the web UI's **Last run** says what happened, even while the NAS is unreachable, and so does `docker logs`.
+
+**The `.ipsw-manager` marker file.** The first run puts a `.ipsw-manager` file in the download folder. If the NAS isn't mounted when the container starts, Docker gives it the empty folder underneath instead. Without this check, the run would then fill the host's disk with IPSWs. When the folder is empty and the marker is missing, the run stops and changes nothing. Don't delete the marker. If you really have emptied the folder or pointed it somewhere new, recreate the marker:
+
+```bash
+docker exec ipsw-manager touch /downloads/.ipsw-manager
+```
+
+The check relies on the container remembering that it has seen the marker, so it doesn't protect the very first run of a newly created container.
 
 ## Releasing a new version
 
