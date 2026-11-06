@@ -19,6 +19,7 @@ Open `http://<host>:8080` to:
 - see downloaded firmware and the run log
 - start a run (**Run Now**) or clear the hash cache and re-verify everything (**Re-verify**)
 - choose which phones to download under **Phones to Download**
+- see the **Release Calendar**: public iOS releases (from ipsw.me), betas and release candidates (from Apple's developer releases feed), and which versions your phones can install now. Apple doesn't announce release dates, so once a release candidate is out the calendar shows the public release as expected about a week later. That date is an estimate.
 
 The selection is saved to `selected-devices.json` in the download folder. Until you save one, iPhone 11 and newer are downloaded.
 

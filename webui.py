@@ -3,6 +3,7 @@
 
 import collections
 import concurrent.futures
+import email.utils
 import glob
 import http.server
 import json
@@ -12,7 +13,8 @@ import subprocess
 import threading
 import time
 import urllib.request
-from datetime import datetime, timezone
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DOWNLOAD_DIR = os.environ.get("IPSW_DOWNLOAD_DIR", "/downloads")
@@ -23,6 +25,16 @@ SELECTION_FILE = os.environ.get(
 )
 PORT = int(os.environ.get("WEBUI_PORT", "8080"))
 API_DEVICES = "https://api.ipsw.me/v4/devices"
+API_DEVICE = "https://api.ipsw.me/v4/device/{}?type=ipsw"
+API_RELEASES = "https://api.ipsw.me/v4/releases"  # public releases of every Apple OS
+APPLE_RELEASES_RSS = "https://developer.apple.com/news/releases/rss/releases.rss"  # betas and RCs
+CALENDAR_CACHE_TTL = 3600  # seconds
+CALENDAR_HISTORY_DAYS = 3 * 365
+RC_TO_RELEASE_DAYS = 7  # public releases usually follow the release candidate by about a week
+IOS_RELEASE_RE = re.compile(r"^iOS (\d+(?:\.\d+)*) \((\w+)\)$")
+IOS_PRERELEASE_RE = re.compile(
+    r"^iOS (\d+(?:\.\d+)*) (beta|RC|Release Candidate)(?: (\d+))?(?: \((\w+)\))?$", re.IGNORECASE
+)
 DEVICE_CACHE_TTL = 3600  # seconds to keep the ipsw.me device list in memory
 IDENTIFIER_RE = re.compile(r"^iPhone(\d+),(\d+)$")
 
@@ -290,6 +302,139 @@ def get_all_iphones():
         return devices
 
 
+def _fetch_json(url, timeout=15):
+    req = urllib.request.Request(url, headers={"User-Agent": "ipsw-manager"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def _version_key(version):
+    return tuple(int(p) for p in version.split("."))
+
+
+def _ipsw_releases(since):
+    """Public iOS releases from ipsw.me, one per version and day."""
+    events = {}
+    for day in _fetch_json(API_RELEASES):
+        for release in day.get("releases", []):
+            if release.get("type") != "iOS":
+                continue
+            m = IOS_RELEASE_RE.match(release.get("name", ""))
+            if not m:
+                continue
+            at = datetime.fromisoformat(release["date"].replace("Z", "+00:00"))
+            if at < since:
+                continue
+            version, build = m.groups()
+            event = events.setdefault((version, at.date()), {
+                "kind": "release", "version": version, "title": f"iOS {version}",
+                "at": at.isoformat(), "builds": [],
+            })
+            event["at"] = min(event["at"], at.isoformat())
+            event["builds"].append(build)
+    return list(events.values())
+
+
+def _apple_prereleases(since):
+    """iOS betas and release candidates from Apple's developer releases feed."""
+    req = urllib.request.Request(APPLE_RELEASES_RSS, headers={"User-Agent": "ipsw-manager"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        root = ET.fromstring(resp.read())
+    events = []
+    for item in root.iter("item"):
+        m = IOS_PRERELEASE_RE.match((item.findtext("title") or "").strip())
+        if not m:
+            continue  # other OSes, Xcode, and public releases (ipsw.me has those)
+        try:
+            at = email.utils.parsedate_to_datetime(item.findtext("pubDate") or "").astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        if at < since:
+            continue
+        version, stage, number, build = m.groups()
+        kind = "beta" if stage.lower() == "beta" else "rc"
+        label = "beta" if kind == "beta" else "RC"
+        events.append({
+            "kind": kind, "version": version,
+            "title": f"iOS {version} {label}" + (f" {number}" if number else ""),
+            "at": at.isoformat(), "builds": [build] if build else [],
+        })
+    return events
+
+
+def _signed_versions(identifiers):
+    """iOS versions Apple currently signs for any of these phones."""
+    def fetch(identifier):
+        try:
+            data = _fetch_json(API_DEVICE.format(identifier))
+        except Exception:
+            return set()
+        return {f["version"] for f in data.get("firmwares", []) if f.get("signed")}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        return set().union(*pool.map(fetch, identifiers)) if identifiers else set()
+
+
+_calendar_cache = {"at": 0.0, "data": None}
+_calendar_lock = threading.Lock()
+
+
+def get_calendar():
+    """Release calendar: public releases, betas, RCs, and an estimate where an RC is out.
+
+    Cached for CALENDAR_CACHE_TTL. Each source can fail on its own; what failed
+    is listed in "errors".
+    """
+    with _calendar_lock:
+        if _calendar_cache["data"] and time.time() - _calendar_cache["at"] < CALENDAR_CACHE_TTL:
+            return _calendar_cache["data"]
+
+        since = datetime.now(timezone.utc) - timedelta(days=CALENDAR_HISTORY_DAYS)
+        events, errors = [], []
+        try:
+            releases = _ipsw_releases(since)
+            events += releases
+        except Exception as exc:
+            releases = []
+            errors.append(f"Couldn't load releases from ipsw.me: {exc}")
+        try:
+            events += _apple_prereleases(since)
+        except Exception as exc:
+            errors.append(f"Couldn't load betas from Apple: {exc}")
+        if not events:
+            raise RuntimeError("; ".join(errors))
+
+        # Versions the selected phones can install now.
+        try:
+            selected = _with_timeout(read_selection, fallback=None)
+            if selected is None:
+                selected = default_selection(get_all_iphones())
+            signed = _signed_versions(selected)
+        except Exception as exc:
+            signed = set()
+            errors.append(f"Couldn't check which versions are signed: {exc}")
+        for event in events:
+            event["signed"] = event["kind"] == "release" and event["version"] in signed
+
+        # An RC with no public release yet: expect it about a week later.
+        released = {e["version"] for e in releases}
+        rcs = [e for e in events if e["kind"] == "rc" and e["version"] not in released]
+        if rcs:
+            latest = max(rcs, key=lambda e: (_version_key(e["version"]), e["at"]))
+            expected = datetime.fromisoformat(latest["at"]) + timedelta(days=RC_TO_RELEASE_DAYS)
+            events.append({
+                "kind": "expected", "version": latest["version"],
+                "title": f"iOS {latest['version']} expected",
+                "at": max(expected, datetime.now(timezone.utc)).isoformat(),
+                "builds": [], "signed": False,
+            })
+
+        events.sort(key=lambda e: e["at"])
+        data = {"events": events, "errors": errors, "fetched_at": datetime.now(timezone.utc).isoformat()}
+        _calendar_cache.update(at=time.time(), data=data)
+        return data
+
+
 def default_selection(devices):
     """Matches the script's behaviour when no selection has been saved: iPhone 11 and newer."""
     return [d["identifier"] for d in devices if _identifier_key(d["identifier"])[0] >= 12]
@@ -368,6 +513,31 @@ tr:hover td{background:rgba(255,255,255,.025)}
 .dev-grid label:hover{background:rgba(255,255,255,.04)}
 .dev-grid input{accent-color:#238636}
 .dev-grid .mono{color:#8b949e;font-size:11px;margin-left:auto}
+.cal-nav{display:flex;align-items:center;gap:6px}
+.cal-nav button{font-size:12px;padding:4px 10px}
+.cal-month{font-size:13px;font-weight:600;min-width:130px;text-align:center}
+.cal-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr))}
+.cal-dow{padding:7px 8px;font-size:11px;color:#8b949e;border-bottom:1px solid #21262d}
+.cal-day{min-height:86px;min-width:0;padding:5px 6px;border-right:1px solid #21262d;border-bottom:1px solid #21262d;display:flex;flex-direction:column;gap:3px}
+.cal-day:nth-child(7n){border-right:none}
+.cal-day.other{background:rgba(0,0,0,.2)}
+.cal-day.other .cal-num{color:#30363d}
+.cal-num{font-size:11px;color:#8b949e;align-self:flex-start;padding:0 5px;border-radius:9px}
+.cal-day.today .cal-num{background:#58a6ff;color:#0d1117;font-weight:600}
+.ev{font-size:11px;padding:2px 6px;border-radius:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border:1px solid transparent}
+.ev-release{background:rgba(63,185,80,.13);color:#3fb950}
+.ev-beta{background:rgba(88,166,255,.13);color:#58a6ff}
+.ev-rc{background:rgba(210,153,34,.13);color:#d2a820}
+.ev-expected{border:1px dashed #8b949e;color:#c9d1d9}
+.cal-foot{padding:12px 18px;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;font-size:12px;color:#8b949e;border-bottom:1px solid #21262d}
+.cal-foot .ev{display:inline-block}
+.cal-err{padding:10px 18px;font-size:12px;color:#d2a820;border-bottom:1px solid #21262d}
+@media (max-width:640px){
+  main{padding:16px}
+  .cal-day{min-height:54px;padding:3px}
+  .cal-day .ev{font-size:0;height:6px;padding:0;border-radius:3px}
+  .cal-month{min-width:0}
+}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 </style>
 </head>
@@ -402,6 +572,30 @@ tr:hover td{background:rgba(255,255,255,.025)}
       <tbody id="files-body">
         <tr><td colspan="5" class="empty">Loading…</td></tr>
       </tbody>
+    </table>
+  </div>
+  <div class="card">
+    <div class="card-hdr">
+      <span class="card-title">Release Calendar</span>
+      <div class="cal-nav">
+        <button class="btn-gray" onclick="shiftMonth(-1)" aria-label="Previous month">&#8249;</button>
+        <span class="cal-month" id="cal-month"></span>
+        <button class="btn-gray" onclick="shiftMonth(1)" aria-label="Next month">&#8250;</button>
+        <button class="btn-gray" onclick="shiftMonth(0)">Today</button>
+      </div>
+    </div>
+    <div id="cal-errors"></div>
+    <div class="cal-grid" id="cal-grid"><div class="empty" style="grid-column:1/-1">Loading…</div></div>
+    <div class="cal-foot">
+      <span class="ev ev-release">Release</span>
+      <span class="ev ev-beta">Beta</span>
+      <span class="ev ev-rc">Release candidate</span>
+      <span class="ev ev-expected">Expected</span>
+      <span>✓ = signed for your phones now. Apple doesn't announce dates: "expected" is a week after the release candidate.</span>
+    </div>
+    <table>
+      <thead><tr><th>Date</th><th>Release</th><th>Build</th><th></th></tr></thead>
+      <tbody id="cal-list"><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
     </table>
   </div>
   <div class="card">
@@ -609,15 +803,85 @@ async function saveDevices() {
     savedSelection = selectionKey();
     document.getElementById("dev-note").textContent =
       "Saved. Takes effect on the next run. Unticked phones' firmware is deleted on the next run.";
+    loadCalendar();  // signed versions depend on the selection
   } catch (e) {
     alert("Save failed: " + e.message);
   }
   updateDeviceMeta();
 }
 
+const EV_LABEL = {release: "Release", beta: "Beta", rc: "Release candidate", expected: "Expected (estimate)"};
+let calEvents = [];
+let calMonth = null;
+
+const dayKey = d => d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+
+function shiftMonth(n) {
+  const now = new Date();
+  calMonth = n === 0 || !calMonth
+    ? new Date(now.getFullYear(), now.getMonth(), 1)
+    : new Date(calMonth.getFullYear(), calMonth.getMonth() + n, 1);
+  renderCalendar();
+}
+
+function eventChip(e) {
+  const tip = EV_LABEL[e.kind] + ": " + e.title + (e.builds.length ? " (" + e.builds.join(", ") + ")" : "")
+    + (e.signed ? " · signed" : "");
+  return '<div class="ev ev-' + e.kind + '" title="' + esc(tip) + '">' + esc(e.title.replace(/^iOS /, "")) + (e.signed ? " ✓" : "") + '</div>';
+}
+
+function renderCalendar() {
+  if (!calMonth) shiftMonth(0);
+  const y = calMonth.getFullYear(), m = calMonth.getMonth();
+  document.getElementById("cal-month").textContent = calMonth.toLocaleDateString(undefined, {month: "long", year: "numeric"});
+
+  const byDay = {};
+  calEvents.forEach(e => (byDay[dayKey(e.date)] ||= []).push(e));
+
+  // Weeks start on Monday. 1 January 2024 was a Monday.
+  let html = "";
+  for (let i = 0; i < 7; i++) {
+    html += '<div class="cal-dow">' + new Date(2024, 0, 1 + i).toLocaleDateString(undefined, {weekday: "short"}) + '</div>';
+  }
+  const offset = (new Date(y, m, 1).getDay() + 6) % 7;
+  const cells = Math.ceil((offset + new Date(y, m + 1, 0).getDate()) / 7) * 7;
+  const today = dayKey(new Date());
+  for (let i = 0; i < cells; i++) {
+    const d = new Date(y, m, 1 - offset + i);
+    const key = dayKey(d);
+    const cls = "cal-day" + (d.getMonth() !== m ? " other" : "") + (key === today ? " today" : "");
+    html += '<div class="' + cls + '"><span class="cal-num">' + d.getDate() + '</span>'
+      + (byDay[key] || []).map(eventChip).join("") + '</div>';
+  }
+  document.getElementById("cal-grid").innerHTML = html;
+
+  const inMonth = calEvents.filter(e => e.date.getFullYear() === y && e.date.getMonth() === m);
+  document.getElementById("cal-list").innerHTML = inMonth.length ? inMonth.map(e =>
+    '<tr><td style="color:#8b949e;white-space:nowrap">' + e.date.toLocaleDateString(undefined, {weekday: "short", day: "numeric", month: "short"}) + '</td>'
+    + '<td><span class="ev ev-' + e.kind + '" style="display:inline-block;vertical-align:middle;margin-right:6px">' + esc(EV_LABEL[e.kind]) + '</span>' + esc(e.title) + '</td>'
+    + '<td class="mono">' + esc(e.builds.join(", ") || "—") + '</td>'
+    + '<td>' + (e.signed ? '<span class="badge badge-green">✓ Signed</span>' : "") + '</td></tr>'
+  ).join("") : '<tr><td colspan="4" class="empty">No releases this month</td></tr>';
+}
+
+async function loadCalendar() {
+  try {
+    const d = await (await fetch("/api/calendar")).json();
+    if (d.error) throw new Error(d.error);
+    calEvents = d.events.map(e => ({...e, date: new Date(e.at)}));
+    document.getElementById("cal-errors").innerHTML = d.errors.map(m => '<div class="cal-err">⚠ ' + esc(m) + '</div>').join("");
+    renderCalendar();
+  } catch (e) {
+    document.getElementById("cal-grid").innerHTML = '<div class="empty" style="grid-column:1/-1">' + esc(e.message) + '</div>';
+    document.getElementById("cal-list").innerHTML = "";
+  }
+}
+
 loadDevices();
+loadCalendar();
 refresh();
 setInterval(refresh, 5000);
+setInterval(loadCalendar, 3600 * 1000);
 </script>
 </body>
 </html>
@@ -669,6 +933,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "download_dir": DOWNLOAD_DIR,
                 }
             )
+        elif self.path == "/api/calendar":
+            try:
+                self.send_json(get_calendar())
+            except Exception as exc:
+                self.send_json({"error": f"Couldn't load the release calendar: {exc}"}, status=502)
         elif self.path == "/api/devices":
             try:
                 devices = get_all_iphones()
@@ -718,6 +987,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     status=503,
                 )
                 return
+            with _calendar_lock:
+                _calendar_cache["at"] = 0.0  # signed versions depend on the selection
             self.send_json({"success": True, "message": f"Saved {len(set(selected))} phones"})
         else:
             self.send_response(404)
