@@ -90,7 +90,8 @@ def is_manager_running():
                 .replace(b"\x00", b" ")
                 .decode("utf-8", errors="replace")
             )
-            if "ipsw-manager.sh" in data:
+            # `--if-new` is the scheduler's quick look at ipsw.me, not a run.
+            if "ipsw-manager.sh" in data and "--if-new" not in data:
                 return True
         except OSError:
             pass

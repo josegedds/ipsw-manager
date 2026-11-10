@@ -6,10 +6,11 @@ Docker image: [`josephgeddes/ipsw-manager`](https://hub.docker.com/r/josephgedde
 
 ## How it works
 
-- On a cron schedule (default: every day at 18:00 GMT), `ipsw-manager.sh` asks [ipsw.me](https://ipsw.me) for the latest signed, non-beta firmware for each selected iPhone.
+- Every 30 minutes (`CHECK_INTERVAL`), `ipsw-manager.sh --if-new` asks [ipsw.me](https://ipsw.me) for the latest signed, non-beta firmware for each selected iPhone. A run starts only when that differs from the last run: Apple has released a new iOS version, stopped signing an old one, or you changed the phone selection. Otherwise the check does nothing and writes nothing to the log.
+- A run downloads whatever is new and removes what is no longer current.
 - Phones that share a firmware file are de-duplicated, so each IPSW downloads once.
 - Each download is checked against its MD5 or SHA-256 checksum, and the saved file is checked to be complete. Verified hashes and sizes are cached (in `.hash-cache/` in the download folder) so later runs don't re-read the files. A file whose size has changed since it was verified is downloaded again.
-- Only one run happens at a time; a scheduled run that starts while another is going is skipped.
+- Only one run happens at a time; one that starts while another is going is skipped.
 - IPSWs that are no longer current, or belong to phones you've unticked, are deleted.
 
 ## Web UI
@@ -39,8 +40,10 @@ Or with Docker Compose: edit the volume path and settings in [`compose.yml`](com
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CRON_SCHEDULE` | `0 18 * * *` | When to run (cron syntax, in `TZ`) |
-| `TZ` | `UTC` | Time zone for the schedule, e.g. `Europe/London` |
+| `CHECK_INTERVAL` | `30` | Minutes between checks for new firmware, 1 to 60. `0` turns the checks off |
+| `CRON_SCHEDULE` | unset | Optional: also do a full run at fixed times (cron syntax, in `TZ`), e.g. `0 18 * * *` |
+| `IPSW_RETRY_MINUTES` | `60` | After a run that didn't finish cleanly, minutes the checks wait (from when it ended) before trying the same firmware again |
+| `TZ` | `UTC` | Time zone for `CRON_SCHEDULE`, e.g. `Europe/London` |
 | `PUID` / `PGID` | unset (root) | User and group to run as, so files on the NAS aren't owned by root. `PGID` defaults to `PUID` |
 | `IPSW_DOWNLOAD_DIR` | `/downloads` | Where IPSWs, the log and the selection are stored |
 | `IPSW_CHECKSUM_ALGO` | `md5` | `md5` or `sha256` |
@@ -49,7 +52,9 @@ Or with Docker Compose: edit the volume path and settings in [`compose.yml`](com
 | `IPSW_RUN_TIMEOUT` | `12h` | Stop a run that takes longer than this (`timeout` syntax, e.g. `90m`). `0` turns it off |
 | `WEBUI_PORT` | `8080` | Web UI port |
 
-The schedule is read by [supercronic](https://github.com/aptible/supercronic). The log's timestamps are always in UTC.
+**When runs happen.** Apple doesn't notify anyone of a release, so "run when a new iOS version is out" means asking often. A check is one small request to ipsw.me per selected phone and doesn't touch the NAS beyond reading the phone selection. A new version is picked up within `CHECK_INTERVAL` minutes of ipsw.me listing it. The first check after the container starts always does a run. A check never notices files deleted from the download folder by hand; use **Run Now** for that, or set `CRON_SCHEDULE` for a regular full run as well. To go back to runs at fixed times only, set `CHECK_INTERVAL=0` and `CRON_SCHEDULE`.
+
+Both are run by [supercronic](https://github.com/aptible/supercronic). The log's timestamps are always in UTC.
 
 **Running as a user.** With `PUID` set, the download folder must be writable by that user; the container warns at startup if it isn't. If you previously ran as root, fix the existing files once on the host:
 
@@ -63,7 +68,7 @@ sudo chown -R 1000:1000 /path/to/ipsw
 
 **If ipsw.me is unreachable.** Lookups are retried. If any phone's lookup still fails, that run downloads what it can but skips the cleanup, so that phone's IPSW isn't deleted.
 
-**If a download fails.** The run carries on with the other phones but skips the cleanup, so a phone whose new firmware didn't download keeps its current IPSW. A download that stalls (under 1 KB/s for two minutes) is abandoned. The next run tries again.
+**If a download fails.** The run carries on with the other phones but skips the cleanup, so a phone whose new firmware didn't download keeps its current IPSW. A download that stalls (under 1 KB/s for two minutes) is abandoned. The checks try again an hour later (`IPSW_RETRY_MINUTES`), or sooner if the firmware changes again, and so does **Run Now** or a `CRON_SCHEDULE` run.
 
 **If the NAS goes offline.** A run that can't write to the download folder stops without deleting anything. A run that hangs on it is stopped after `IPSW_RUN_TIMEOUT`, so later runs aren't blocked behind it. Either way the web UI's **Last run** says what happened, even while the NAS is unreachable, and so does `docker logs`.
 

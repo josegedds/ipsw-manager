@@ -17,10 +17,13 @@ RUN apk add --no-cache \
 COPY --chmod=755 ipsw-manager.sh webui.py /usr/local/bin/
 COPY --chmod=755 entrypoint.sh /entrypoint.sh
 
-# Default schedule. Override at run time with -e CRON_SCHEDULE=...;
-# the build arg still works for baking in a different default.
-ARG CRON_SCHEDULE="0 18 * * *"
-ENV CRON_SCHEDULE=${CRON_SCHEDULE} \
+# By default ipsw.me is checked every 30 minutes and a run starts when the
+# firmware changes; there is no fixed schedule. Override either at run time
+# with -e CHECK_INTERVAL=... / -e CRON_SCHEDULE=...; the build arg still
+# works for baking in a schedule.
+ARG CRON_SCHEDULE=""
+ENV CHECK_INTERVAL=30 \
+    CRON_SCHEDULE=${CRON_SCHEDULE} \
     TZ=UTC \
     IPSW_DOWNLOAD_DIR=/downloads \
     IPSW_CHECKSUM_ALGO=md5 \

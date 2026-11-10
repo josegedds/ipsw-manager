@@ -45,6 +45,13 @@ STATE_DIR="${TMPDIR:-/tmp}"
 SEEN_MARKER_FILE="${STATE_DIR}/ipsw-manager-seen-marker"   # we've seen the marker before
 LAST_RUN_FILE="${STATE_DIR}/ipsw-manager-last-run"         # outcome of the last run
 RUN_STARTED_FILE="${STATE_DIR}/ipsw-manager-run-started"   # removed when a run ends
+# The firmware URLs ipsw.me listed at the last run that finished cleanly, and
+# at the last run that got as far as looking. `--if-new` compares against them.
+SYNCED_FILE="${STATE_DIR}/ipsw-manager-synced"
+ATTEMPTED_FILE="${STATE_DIR}/ipsw-manager-attempted"
+# After a run that didn't finish cleanly, `--if-new` waits this many minutes
+# (counted from when the run ended) before trying the same firmware again.
+RETRY_MINUTES="${IPSW_RETRY_MINUTES:-60}"
 
 timestamp() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 
@@ -52,6 +59,118 @@ log() {
   local MSG="$1"
   printf "%s  %s\n" "$(timestamp)" "$MSG" | tee -a "$LOG_FILE"
 }
+
+# ---------------------------------------------------------------------------
+# Looking up firmware on ipsw.me. Shared by a full run and the `--if-new`
+# check below.
+# ---------------------------------------------------------------------------
+
+# Sets DEVICES, and DEVICES_FROM to where the list came from.
+load_devices() {
+  DEVICES=()
+  DEVICES_FROM=selection
+  if [[ -s "$SELECTION_FILE" ]]; then
+    DEVICES=($(jq -r '.[] | select(type == "string" and test("^iPhone[0-9]+,[0-9]+$"))' "$SELECTION_FILE" 2>/dev/null || true))
+  fi
+  if (( ${#DEVICES[@]} == 0 )); then
+    DEVICES_FROM=default
+    DEVICES=($(curl -sS --fail --retry 3 --retry-delay 5 --max-time 60 "$API_DEVICES" | jq -r '
+      .[]
+      | select(.identifier | startswith("iPhone"))
+      | select(.identifier | capture("iPhone(?<num>[0-9]+),").num | tonumber >= 12)
+      | .identifier
+    ' || true))
+  fi
+}
+
+# Writes one JSON file per device into $META_DIR:
+#   $META_DIR/<identifier>  →  {"url":…,"version":…,"sha256sum":…,"filesize":…}
+fetch_meta() {
+  local DEVICE="$1"
+  local OUT="$META_DIR/$DEVICE"
+
+  local JSON
+  # A failed lookup is recorded as $OUT.failed so the cleanup step knows the
+  # device's current IPSW is unknown, rather than no longer needed.
+  if ! JSON=$(curl -sS --fail --retry 3 --retry-delay 5 --max-time 60 "$API_BASE/$DEVICE?type=ipsw"); then
+    echo "⚠️  $DEVICE: Couldn't fetch firmware list from ipsw.me"
+    touch "$OUT.failed"
+    return
+  fi
+
+  # Extract the latest signed non-beta firmware entry as a compact JSON object
+  echo "$JSON" | jq -c '
+    .firmwares
+    | map(select(.signed == true and (.version | contains("beta") | not)))
+    | sort_by(.releasedate)
+    | reverse
+    | .[0]
+    | if . == null then null
+      else { url, version, md5sum, sha256sum, filesize: (.filesize // 0) }
+      end
+  ' > "$OUT" || { echo "⚠️  $DEVICE: Unreadable reply from ipsw.me"; rm -f "$OUT"; touch "$OUT.failed"; }
+}
+
+# Looks up every device in DEVICES, eight at a time.
+fetch_all_meta() {
+  export -f fetch_meta
+  export API_BASE META_DIR
+  printf "%s\n" "${DEVICES[@]}" | xargs -P 8 -I {} bash -c 'fetch_meta "$@"' _ {}
+}
+
+# The firmware files the looked-up devices need: their URLs, sorted, one each.
+wanted_urls() {
+  { cat "$META_DIR"/* 2>/dev/null | jq -r '.url // empty' 2>/dev/null | sort -u; } || true
+}
+
+# ---------------------------------------------------------------------------
+# `ipsw-manager.sh --if-new`: start a run only if ipsw.me lists different
+# firmware from the last run. Apple doesn't announce releases to anyone, so
+# "run when a new iOS version is out" means asking often; this is the cheap
+# way to ask. It only talks to ipsw.me, reads nothing from the NAS beyond the
+# phone selection, and writes nothing to the log unless it starts a run.
+# ---------------------------------------------------------------------------
+
+if [[ "${1:-}" == "--if-new" ]]; then
+  if command -v flock &>/dev/null; then
+    # Leave it if an earlier check is still going (hung on the NAS, say) ...
+    exec 8>"${STATE_DIR}/ipsw-manager-check.lock"
+    flock -n 8 || exit 0
+    # ... or if a run is. The run lock is only tested here, not kept.
+    exec 9>"${STATE_DIR}/ipsw-manager.lock"
+    flock -n 9 || exit 0
+    exec 9>&-
+  fi
+
+  load_devices 2>/dev/null
+  (( ${#DEVICES[@]} > 0 )) || exit 0   # ipsw.me unreachable — ask again next time
+
+  META_DIR=$(mktemp -d)
+  trap 'rm -rf "$META_DIR"' EXIT
+  fetch_all_meta >/dev/null 2>&1 || exit 0
+  # With a lookup missing, the list is incomplete and proves nothing.
+  if compgen -G "$META_DIR/*.failed" >/dev/null; then exit 0; fi
+  WANTED=$(wanted_urls)
+
+  if [[ ! -f "$SYNCED_FILE" ]]; then
+    REASON="First check since the container started"
+  elif [[ "$WANTED" != "$(cat "$SYNCED_FILE")" ]]; then
+    REASON="New firmware on ipsw.me, or the phone selection changed"
+  else
+    exit 0
+  fi
+  # A run for exactly this firmware didn't finish cleanly a short while ago.
+  if [[ -f "$ATTEMPTED_FILE" && "$WANTED" == "$(cat "$ATTEMPTED_FILE")" \
+        && -n "$(find "$ATTEMPTED_FILE" -mmin "-${RETRY_MINUTES}" 2>/dev/null)" ]]; then
+    exit 0
+  fi
+
+  rm -rf "$META_DIR"
+  trap - EXIT
+  exec 8>&-
+  export _IPSW_REASON="$REASON"
+  exec "$BASH" "$0"
+fi
 
 # ---------------------------------------------------------------------------
 # Ending a run. Every run that gets past the lock records a one-line outcome
@@ -93,6 +212,10 @@ on_exit() {
       } </dev/null >/dev/null 2>&1 9>&- &
     fi
   fi
+
+  # Still here means the run didn't finish cleanly (a clean one renames it).
+  # The wait before `--if-new` retries counts from now, not from the start.
+  [[ -e "$ATTEMPTED_FILE" ]] && touch "$ATTEMPTED_FILE" 2>/dev/null
 
   if [[ -n "$RESULT" ]]; then
     printf "%s  %s\n" "$(timestamp)" "$RESULT" > "$LAST_RUN_FILE" 2>/dev/null || true
@@ -162,20 +285,13 @@ fi
 # that the run didn't finish.
 timestamp > "$RUN_STARTED_FILE"
 
-DEVICES=()
-if [[ -s "$SELECTION_FILE" ]]; then
-  log "📋 Using phones selected in the web UI..."
-  DEVICES=($(jq -r '.[] | select(type == "string" and test("^iPhone[0-9]+,[0-9]+$"))' "$SELECTION_FILE" 2>/dev/null || true))
-fi
+[[ -n "${_IPSW_REASON:-}" ]] && log "🆕 ${_IPSW_REASON} — starting a run."
 
-if (( ${#DEVICES[@]} == 0 )); then
-  log "📡 No saved selection — fetching device list (iPhone 11 and newer)..."
-  DEVICES=($(curl -sS --fail --retry 3 --retry-delay 5 --max-time 60 "$API_DEVICES" | jq -r '
-    .[]
-    | select(.identifier | startswith("iPhone"))
-    | select(.identifier | capture("iPhone(?<num>[0-9]+),").num | tonumber >= 12)
-    | .identifier
-  ' || true))
+load_devices
+if [[ "$DEVICES_FROM" == selection ]]; then
+  log "📋 Using phones selected in the web UI..."
+else
+  log "📡 No saved selection — using the device list (iPhone 11 and newer)..."
 fi
 
 # Without a device list the cleanup step below would delete every IPSW.
@@ -189,8 +305,7 @@ log "📱 Checking ${#DEVICES[@]} iPhone devices — fetching firmware metadata.
 # Phase 1: fetch firmware metadata for every device in parallel, then
 # deduplicate by URL so each unique IPSW is only downloaded once.
 #
-# Results land in a temp dir as one JSON file per device:
-#   $META_DIR/<identifier>  →  {"url":…,"version":…,"sha256sum":…,"filesize":…}
+# Results land in a temp dir as one JSON file per device (see fetch_meta).
 # ---------------------------------------------------------------------------
 
 META_DIR=$(mktemp -d)
@@ -199,36 +314,10 @@ TMP_FILE=$(mktemp)
 # show a percentage and time remaining. Inside the container, not on the NAS.
 PROGRESS_FILE="${TMPDIR:-/tmp}/ipsw-manager-download"
 
-fetch_meta() {
-  local DEVICE="$1"
-  local OUT="$META_DIR/$DEVICE"
-
-  local JSON
-  # A failed lookup is recorded as $OUT.failed so the cleanup step knows the
-  # device's current IPSW is unknown, rather than no longer needed.
-  if ! JSON=$(curl -sS --fail --retry 3 --retry-delay 5 --max-time 60 "$API_BASE/$DEVICE?type=ipsw"); then
-    echo "⚠️  $DEVICE: Couldn't fetch firmware list from ipsw.me"
-    touch "$OUT.failed"
-    return
-  fi
-
-  # Extract the latest signed non-beta firmware entry as a compact JSON object
-  echo "$JSON" | jq -c '
-    .firmwares
-    | map(select(.signed == true and (.version | contains("beta") | not)))
-    | sort_by(.releasedate)
-    | reverse
-    | .[0]
-    | if . == null then null
-      else { url, version, md5sum, sha256sum, filesize: (.filesize // 0) }
-      end
-  ' > "$OUT" || { echo "⚠️  $DEVICE: Unreadable reply from ipsw.me"; rm -f "$OUT"; touch "$OUT.failed"; }
-}
-
-export -f fetch_meta
-export API_BASE META_DIR
-
-printf "%s\n" "${DEVICES[@]}" | xargs -P 8 -I {} bash -c 'fetch_meta "$@"' _ {}
+fetch_all_meta
+# Recorded before anything is downloaded, so a run that fails isn't started
+# again by every `--if-new` check (see RETRY_MINUTES).
+wanted_urls > "$ATTEMPTED_FILE" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Build a deduplicated download manifest.
@@ -462,7 +551,7 @@ download_unique() {
       sleep 0.5
       draw_progress "$LABEL" "$VERSION" "$(file_size "$PARTIAL_PATH" 2>/dev/null || echo 0)" "$FILESIZE"
     done
-  ) &
+  ) 9>&- &   # without the run lock, which its last sleep would hold on to briefly
   POLLER_PID=$!
 
   draw_progress "$LABEL" "$VERSION" 0 "$FILESIZE"
@@ -587,5 +676,8 @@ for FILE in "$DOWNLOAD_DIR"/*.ipsw; do
     (( REMOVED++ )) || true
   fi
 done
+
+# What ipsw.me listed is now what's in the folder.
+mv -f "$ATTEMPTED_FILE" "$SYNCED_FILE" 2>/dev/null || true
 
 finish 0 "✅ Done — ${#KEEP_FILES[@]} file(s) retained, $REMOVED removed."

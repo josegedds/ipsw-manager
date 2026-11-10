@@ -11,8 +11,12 @@ services:
       # Use "127.0.0.1:8080:8080" to reach the web UI from this host only.
       - "8080:8080"
     environment:
-      # When to run, in cron syntax, in the time zone below.
-      CRON_SCHEDULE: "0 18 * * *"
+      # How often (in minutes) to ask ipsw.me whether new firmware is out.
+      # A run starts only when it is. 0 turns the checks off.
+      CHECK_INTERVAL: "30"
+      # Optional: also do a full run at fixed times (cron syntax, in the
+      # time zone below).
+      # CRON_SCHEDULE: "0 18 * * *"
       TZ: Europe/London
       # Run as this user and group so files on the NAS aren't owned by root.
       # The download folder must be writable by them. Remove both to run as root.

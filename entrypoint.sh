@@ -1,17 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CRON_SCHEDULE="${CRON_SCHEDULE:-0 18 * * *}"
+CHECK_INTERVAL="${CHECK_INTERVAL-30}"
+CRON_SCHEDULE="${CRON_SCHEDULE:-}"
 CRONTAB_FILE=/tmp/crontab
 
-# The schedule comes from the environment, so it can be changed with
-# `-e CRON_SCHEDULE=...` without rebuilding. supercronic passes the
-# container's environment straight through to the job.
-echo "${CRON_SCHEDULE} /usr/local/bin/ipsw-manager.sh" > "$CRONTAB_FILE"
+# Both settings come from the environment, so they can be changed with
+# `-e ...` without rebuilding. supercronic passes the container's
+# environment straight through to the jobs.
+#
+# CHECK_INTERVAL: every that many minutes, ask ipsw.me whether the firmware
+# for the selected phones has changed, and start a run only if it has.
+# CRON_SCHEDULE: optionally, a full run at fixed times as well.
+: > "$CRONTAB_FILE"
+case "$CHECK_INTERVAL" in
+  ""|0|off) CHECK_INTERVAL="" ;;
+  60) echo "0 * * * * /usr/local/bin/ipsw-manager.sh --if-new" >> "$CRONTAB_FILE" ;;
+  *)
+    if [[ ! "$CHECK_INTERVAL" =~ ^[1-9][0-9]?$ ]] || (( CHECK_INTERVAL > 60 )); then
+      echo "❌ CHECK_INTERVAL must be a number of minutes from 1 to 60, or 0 to turn it off (got '${CHECK_INTERVAL}')" >&2
+      exit 1
+    fi
+    echo "*/${CHECK_INTERVAL} * * * * /usr/local/bin/ipsw-manager.sh --if-new" >> "$CRONTAB_FILE"
+    ;;
+esac
+[[ "$CRON_SCHEDULE" == off ]] && CRON_SCHEDULE=""
+if [[ -n "$CRON_SCHEDULE" ]]; then
+  echo "${CRON_SCHEDULE} /usr/local/bin/ipsw-manager.sh" >> "$CRONTAB_FILE"
+fi
+if [[ ! -s "$CRONTAB_FILE" ]]; then
+  echo "❌ Nothing to do: CHECK_INTERVAL is off and CRON_SCHEDULE isn't set. Set one of them." >&2
+  exit 1
+fi
 if ! supercronic -test "$CRONTAB_FILE" >/dev/null 2>&1; then
   echo "❌ Invalid CRON_SCHEDULE: '${CRON_SCHEDULE}'" >&2
   exit 1
 fi
+
+# Forget what the last container run saw, so the first check after a start
+# or restart does a run and confirms the folder is up to date.
+rm -f "${TMPDIR:-/tmp}/ipsw-manager-synced" "${TMPDIR:-/tmp}/ipsw-manager-attempted"
 
 # Optional PUID/PGID: run everything as that user so files on the NAS aren't
 # owned by root. ipsw-manager.sh does the same switch for `docker exec` runs.
@@ -37,11 +65,16 @@ fi
 echo "🐳 ipsw-manager container started (Alpine $(cat /etc/alpine-release))"
 echo "   Download dir : ${IPSW_DOWNLOAD_DIR}"
 echo "   Checksum algo: ${IPSW_CHECKSUM_ALGO}"
-echo "   Cron schedule: ${CRON_SCHEDULE} (${TZ:-UTC})"
+if [[ -n "$CHECK_INTERVAL" ]]; then
+  echo "   New firmware : checked every ${CHECK_INTERVAL} min, run when it changes"
+else
+  echo "   New firmware : not checked (CHECK_INTERVAL is off)"
+fi
+[[ -n "$CRON_SCHEDULE" ]] && echo "   Cron schedule: ${CRON_SCHEDULE} (${TZ:-UTC})"
 echo "   Running as   : ${PUID:-$(id -u)}:${PGID:-$(id -g)}"
 echo "   Web UI        : http://0.0.0.0:${WEBUI_PORT:-8080}"
 echo ""
-echo "Logs will appear here as cron fires. To run immediately:"
+echo "Logs will appear here when a run starts. To run immediately:"
 echo "  docker exec -it <container> ipsw-manager.sh"
 
 # Both processes share stdout/stderr, so their output appears in `docker logs`.
