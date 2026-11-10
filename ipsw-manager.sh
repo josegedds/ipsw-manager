@@ -50,8 +50,8 @@ RUN_STARTED_FILE="${STATE_DIR}/ipsw-manager-run-started"   # removed when a run 
 SYNCED_FILE="${STATE_DIR}/ipsw-manager-synced"
 ATTEMPTED_FILE="${STATE_DIR}/ipsw-manager-attempted"
 # After a run that didn't finish cleanly, `--if-new` waits this many minutes
-# before trying the same firmware again.
-RETRY_MINUTES="${IPSW_RETRY_MINUTES:-360}"
+# (counted from when the run ended) before trying the same firmware again.
+RETRY_MINUTES="${IPSW_RETRY_MINUTES:-60}"
 
 timestamp() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 
@@ -212,6 +212,10 @@ on_exit() {
       } </dev/null >/dev/null 2>&1 9>&- &
     fi
   fi
+
+  # Still here means the run didn't finish cleanly (a clean one renames it).
+  # The wait before `--if-new` retries counts from now, not from the start.
+  [[ -e "$ATTEMPTED_FILE" ]] && touch "$ATTEMPTED_FILE" 2>/dev/null
 
   if [[ -n "$RESULT" ]]; then
     printf "%s  %s\n" "$(timestamp)" "$RESULT" > "$LAST_RUN_FILE" 2>/dev/null || true

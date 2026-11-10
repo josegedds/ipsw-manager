@@ -42,7 +42,7 @@ Or with Docker Compose: edit the volume path and settings in [`compose.yml`](com
 | --- | --- | --- |
 | `CHECK_INTERVAL` | `30` | Minutes between checks for new firmware, 1 to 60. `0` turns the checks off |
 | `CRON_SCHEDULE` | unset | Optional: also do a full run at fixed times (cron syntax, in `TZ`), e.g. `0 18 * * *` |
-| `IPSW_RETRY_MINUTES` | `360` | After a run that didn't finish cleanly, how long the checks wait before trying the same firmware again |
+| `IPSW_RETRY_MINUTES` | `60` | After a run that didn't finish cleanly, minutes the checks wait (from when it ended) before trying the same firmware again |
 | `TZ` | `UTC` | Time zone for `CRON_SCHEDULE`, e.g. `Europe/London` |
 | `PUID` / `PGID` | unset (root) | User and group to run as, so files on the NAS aren't owned by root. `PGID` defaults to `PUID` |
 | `IPSW_DOWNLOAD_DIR` | `/downloads` | Where IPSWs, the log and the selection are stored |
@@ -68,7 +68,7 @@ sudo chown -R 1000:1000 /path/to/ipsw
 
 **If ipsw.me is unreachable.** Lookups are retried. If any phone's lookup still fails, that run downloads what it can but skips the cleanup, so that phone's IPSW isn't deleted.
 
-**If a download fails.** The run carries on with the other phones but skips the cleanup, so a phone whose new firmware didn't download keeps its current IPSW. A download that stalls (under 1 KB/s for two minutes) is abandoned. The checks try again after `IPSW_RETRY_MINUTES` (sooner if the firmware changes again), and so does **Run Now** or a `CRON_SCHEDULE` run.
+**If a download fails.** The run carries on with the other phones but skips the cleanup, so a phone whose new firmware didn't download keeps its current IPSW. A download that stalls (under 1 KB/s for two minutes) is abandoned. The checks try again an hour later (`IPSW_RETRY_MINUTES`), or sooner if the firmware changes again, and so does **Run Now** or a `CRON_SCHEDULE` run.
 
 **If the NAS goes offline.** A run that can't write to the download folder stops without deleting anything. A run that hangs on it is stopped after `IPSW_RUN_TIMEOUT`, so later runs aren't blocked behind it. Either way the web UI's **Last run** says what happened, even while the NAS is unreachable, and so does `docker logs`.
 
