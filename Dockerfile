@@ -14,7 +14,7 @@ RUN apk add --no-cache \
     tini \
     tzdata
 
-COPY --chmod=755 ipsw-manager.sh webui.py /usr/local/bin/
+COPY --chmod=755 ipsw-manager.sh webui.py apple_feed.py /usr/local/bin/
 COPY --chmod=755 entrypoint.sh /entrypoint.sh
 
 # By default ipsw.me is checked every 30 minutes and a run starts when the

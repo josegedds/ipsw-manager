@@ -17,6 +17,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import apple_feed
+
 DOWNLOAD_DIR = os.environ.get("IPSW_DOWNLOAD_DIR", "/downloads")
 HASH_CACHE_DIR = os.environ.get("IPSW_HASH_CACHE_DIR", os.path.join(DOWNLOAD_DIR, ".hash-cache"))
 LOG_FILE = os.path.join(DOWNLOAD_DIR, "ipsw-manager.log")
@@ -28,6 +30,7 @@ API_DEVICES = "https://api.ipsw.me/v4/devices"
 API_DEVICE = "https://api.ipsw.me/v4/device/{}?type=ipsw"
 API_RELEASES = "https://api.ipsw.me/v4/releases"  # public releases of every Apple OS
 APPLE_RELEASES_RSS = "https://developer.apple.com/news/releases/rss/releases.rss"  # betas and RCs
+APPLE_FEED_CACHE_TTL = 600  # seconds to keep Apple's firmware feed (the ipsw.me fallback) in memory
 CALENDAR_CACHE_TTL = 3600  # seconds
 CALENDAR_HISTORY_DAYS = 3 * 365
 RC_TO_RELEASE_DAYS = 7  # public releases usually follow the release candidate by about a week
@@ -282,14 +285,42 @@ def _identifier_key(identifier):
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 
+_apple_feed_cache = {"at": 0.0, "firmware": None}
+_apple_feed_lock = threading.Lock()
+
+
+def get_apple_firmware():
+    """Apple's own firmware feed, the fallback for ipsw.me. Cached for APPLE_FEED_CACHE_TTL."""
+    with _apple_feed_lock:
+        if _apple_feed_cache["firmware"] and time.time() - _apple_feed_cache["at"] < APPLE_FEED_CACHE_TTL:
+            return _apple_feed_cache["firmware"]
+        firmware = apple_feed.fetch(timeout=30)
+        _apple_feed_cache.update(at=time.time(), firmware=firmware)
+        return firmware
+
+
 def get_all_iphones():
-    """Every iPhone known to ipsw.me, newest first. Cached for DEVICE_CACHE_TTL."""
+    """Every iPhone known to ipsw.me, newest first. Cached for DEVICE_CACHE_TTL.
+
+    If ipsw.me can't be reached, the last list it gave is used, or failing
+    that Apple's feed, which has the identifiers but not the names.
+    """
     with _device_lock:
         if _device_cache["devices"] and time.time() - _device_cache["at"] < DEVICE_CACHE_TTL:
             return _device_cache["devices"]
-        req = urllib.request.Request(API_DEVICES, headers={"User-Agent": "ipsw-manager"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.load(resp)
+        try:
+            data = _fetch_json(API_DEVICES)
+        except Exception as exc:
+            if _device_cache["devices"]:
+                _device_cache["at"] = time.time() - DEVICE_CACHE_TTL + APPLE_FEED_CACHE_TTL
+                return _device_cache["devices"]
+            try:
+                data = [{"identifier": identifier} for identifier in get_apple_firmware()]
+            except Exception:
+                raise exc
+            cache_for = APPLE_FEED_CACHE_TTL  # look for ipsw.me's names again soon
+        else:
+            cache_for = DEVICE_CACHE_TTL
         devices = sorted(
             (
                 {"identifier": d["identifier"], "name": d.get("name") or d["identifier"]}
@@ -299,7 +330,7 @@ def get_all_iphones():
             key=lambda d: _identifier_key(d["identifier"]),
             reverse=True,
         )
-        _device_cache.update(at=time.time(), devices=devices)
+        _device_cache.update(at=time.time() - DEVICE_CACHE_TTL + cache_for, devices=devices)
         return devices
 
 
@@ -336,21 +367,36 @@ def _ipsw_releases(since):
     return list(events.values())
 
 
-def _apple_prereleases(since):
-    """iOS betas and release candidates from Apple's developer releases feed."""
+def _apple_releases(since):
+    """iOS releases from Apple's developer releases feed: (betas and RCs, public releases).
+
+    The feed only goes back a few months, so its public releases are just the
+    fallback for when ipsw.me's can't be loaded.
+    """
     req = urllib.request.Request(APPLE_RELEASES_RSS, headers={"User-Agent": "ipsw-manager"})
     with urllib.request.urlopen(req, timeout=15) as resp:
         root = ET.fromstring(resp.read())
-    events = []
+    events, public = [], {}
     for item in root.iter("item"):
-        m = IOS_PRERELEASE_RE.match((item.findtext("title") or "").strip())
-        if not m:
-            continue  # other OSes, Xcode, and public releases (ipsw.me has those)
+        title = (item.findtext("title") or "").strip()
+        m = IOS_PRERELEASE_RE.match(title)
+        released = IOS_RELEASE_RE.match(title)
+        if not m and not released:
+            continue  # other OSes, Xcode
         try:
             at = email.utils.parsedate_to_datetime(item.findtext("pubDate") or "").astimezone(timezone.utc)
         except (TypeError, ValueError):
             continue
         if at < since:
+            continue
+        if released:
+            version, build = released.groups()
+            event = public.setdefault((version, at.date()), {
+                "kind": "release", "version": version, "title": f"iOS {version}",
+                "at": at.isoformat(), "builds": [],
+            })
+            event["at"] = min(event["at"], at.isoformat())
+            event["builds"].append(build)
             continue
         version, stage, number, build = m.groups()
         kind = "beta" if stage.lower() == "beta" else "rc"
@@ -360,7 +406,7 @@ def _apple_prereleases(since):
             "title": f"iOS {version} {label}" + (f" {number}" if number else ""),
             "at": at.isoformat(), "builds": [build] if build else [],
         })
-    return events
+    return events, list(public.values())
 
 
 def _signed_versions(identifiers):
@@ -369,7 +415,11 @@ def _signed_versions(identifiers):
         try:
             data = _fetch_json(API_DEVICE.format(identifier))
         except Exception:
-            return set()
+            # Apple's feed: the one version the phone is restored to.
+            try:
+                return {get_apple_firmware()[identifier]["version"]}
+            except Exception:
+                return set()
         return {f["version"] for f in data.get("firmwares", []) if f.get("signed")}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -393,15 +443,21 @@ def get_calendar():
         since = datetime.now(timezone.utc) - timedelta(days=CALENDAR_HISTORY_DAYS)
         events, errors = [], []
         try:
-            releases = _ipsw_releases(since)
-            events += releases
+            prereleases, recent_releases = _apple_releases(since)
+            events += prereleases
         except Exception as exc:
-            releases = []
-            errors.append(f"Couldn't load releases from ipsw.me: {exc}")
-        try:
-            events += _apple_prereleases(since)
-        except Exception as exc:
+            recent_releases = []
             errors.append(f"Couldn't load betas from Apple: {exc}")
+        try:
+            releases = _ipsw_releases(since)
+        except Exception as exc:
+            releases = recent_releases
+            errors.append(
+                f"Couldn't load releases from ipsw.me ({exc}) — "
+                "showing only the recent ones in Apple's feed" if releases
+                else f"Couldn't load releases from ipsw.me: {exc}"
+            )
+        events += releases
         if not events:
             raise RuntimeError("; ".join(errors))
 
@@ -943,7 +999,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 devices = get_all_iphones()
             except Exception as exc:
-                self.send_json({"error": f"Couldn't fetch device list from ipsw.me: {exc}"}, status=502)
+                self.send_json({"error": f"Couldn't fetch the device list from ipsw.me or Apple: {exc}"}, status=502)
                 return
             saved = _with_timeout(read_selection, fallback=None)
             self.send_json(

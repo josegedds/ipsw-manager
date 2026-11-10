@@ -28,6 +28,8 @@ DOWNLOAD_DIR="${IPSW_DOWNLOAD_DIR:-$PWD/ipsw}"
 CHECKSUM_ALGO="${IPSW_CHECKSUM_ALGO:-md5}"   # md5 or sha256
 API_DEVICES="https://api.ipsw.me/v4/devices"
 API_BASE="https://api.ipsw.me/v4/device"
+# Apple's own firmware feed, read when ipsw.me can't be (see apple_fallback).
+APPLE_FEED_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/apple_feed.py"
 LOG_FILE="${DOWNLOAD_DIR}/ipsw-manager.log"
 # Phones picked in the web UI, as a JSON array of identifiers. If it doesn't
 # exist yet, every iPhone 11 and newer is downloaded.
@@ -52,6 +54,12 @@ ATTEMPTED_FILE="${STATE_DIR}/ipsw-manager-attempted"
 # After a run that didn't finish cleanly, `--if-new` waits this many minutes
 # (counted from when the run ended) before trying the same firmware again.
 RETRY_MINUTES="${IPSW_RETRY_MINUTES:-60}"
+# When `--if-new` first found ipsw.me not answering. It waits this many
+# minutes before acting on Apple's feed instead, so a short outage doesn't
+# start a run. Apple's feed can list a different build for the odd phone, and
+# swapping to it and back means downloading both.
+IPSWME_DOWN_FILE="${STATE_DIR}/ipsw-manager-ipswme-down"
+FALLBACK_MINUTES="${IPSW_FALLBACK_MINUTES:-120}"
 
 timestamp() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 
@@ -64,6 +72,16 @@ log() {
 # Looking up firmware on ipsw.me. Shared by a full run and the `--if-new`
 # check below.
 # ---------------------------------------------------------------------------
+
+# Firmware is only ever downloaded from Apple: a URL on any other host, or
+# one that isn't plainly an .ipsw file, is treated as a failed lookup. So a
+# source that has been taken over or is simply wrong can't put someone else's
+# file in the folder (it supplies the checksum too, so that proves nothing).
+url_allowed() {
+  [[ "$1" =~ ^https?://([a-z0-9-]+\.)*(apple\.com|cdn-apple\.com)/[A-Za-z0-9._,/%+-]+\.ipsw$ ]]
+}
+
+apple_feed() { python3 "$APPLE_FEED_PY" 2>/dev/null; }
 
 # Sets DEVICES, and DEVICES_FROM to where the list came from.
 load_devices() {
@@ -80,6 +98,12 @@ load_devices() {
       | select(.identifier | capture("iPhone(?<num>[0-9]+),").num | tonumber >= 12)
       | .identifier
     ' || true))
+  fi
+  if (( ${#DEVICES[@]} == 0 )); then   # ipsw.me didn't answer — Apple's list
+    DEVICES=($(apple_feed | jq -r '
+      keys[]
+      | select((capture("^iPhone(?<num>[0-9]+),[0-9]+$").num | tonumber) >= 12)
+    ' 2>/dev/null || true))
   fi
 }
 
@@ -106,16 +130,59 @@ fetch_meta() {
     | reverse
     | .[0]
     | if . == null then null
-      else { url, version, md5sum, sha256sum, filesize: (.filesize // 0) }
+      else { url, version, md5sum, sha256sum, sha1sum, filesize: (.filesize // 0) }
       end
-  ' > "$OUT" || { echo "⚠️  $DEVICE: Unreadable reply from ipsw.me"; rm -f "$OUT"; touch "$OUT.failed"; }
+  ' > "$OUT" || { echo "⚠️  $DEVICE: Unreadable reply from ipsw.me"; rm -f "$OUT"; touch "$OUT.failed"; return; }
+
+  local URL
+  URL=$(jq -r '.url // empty' "$OUT")
+  if [[ -n "$URL" ]] && ! url_allowed "$URL"; then
+    echo "⚠️  $DEVICE: ipsw.me listed a download that isn't on an Apple host — ignoring it: $URL"
+    rm -f "$OUT"
+    touch "$OUT.failed"
+  fi
 }
 
 # Looks up every device in DEVICES, eight at a time.
 fetch_all_meta() {
-  export -f fetch_meta
+  export -f fetch_meta url_allowed
   export API_BASE META_DIR
   printf "%s\n" "${DEVICES[@]}" | xargs -P 8 -I {} bash -c 'fetch_meta "$@"' _ {}
+}
+
+# Fills in the lookups that failed from Apple's own feed (apple_feed.py).
+# Sets LOOKUPS_FAILED to how many there were and FALLBACK_USED to how many
+# Apple's feed answered; the rest stay marked as failed.
+apple_fallback() {
+  LOOKUPS_FAILED=0
+  FALLBACK_USED=0
+  local FAILED=("$META_DIR"/*.failed)
+  [[ -e "${FAILED[0]}" ]] || return 0
+  LOOKUPS_FAILED=${#FAILED[@]}
+
+  local FEED="$META_DIR/.apple-feed" F DEVICE ENTRY URL
+  if ! apple_feed > "$FEED"; then
+    echo "⚠️  Couldn't load Apple's firmware feed either"
+    rm -f "$FEED"
+    return 0
+  fi
+  for F in "${FAILED[@]}"; do
+    DEVICE=$(basename "$F" .failed)
+    ENTRY=$(jq -c --arg d "$DEVICE" \
+      '.[$d] // empty | { url, version, sha1sum, filesize: 0, source: "apple" }' "$FEED" 2>/dev/null || true)
+    URL=$(jq -r '.url // empty' <<< "$ENTRY" 2>/dev/null || true)
+    if [[ -z "$URL" ]]; then
+      echo "⚠️  $DEVICE: Not in Apple's firmware feed"
+    elif ! url_allowed "$URL"; then
+      # The original iPhone's, on a host that isn't Apple's own.
+      echo "⚠️  $DEVICE: Apple's feed lists a download this won't fetch: $URL"
+    else
+      echo "$ENTRY" > "$META_DIR/$DEVICE"
+      rm -f "$F"
+      (( FALLBACK_USED++ )) || true
+    fi
+  done
+  rm -f "$FEED"
 }
 
 # The firmware files the looked-up devices need: their URLs, sorted, one each.
@@ -148,14 +215,23 @@ if [[ "${1:-}" == "--if-new" ]]; then
   META_DIR=$(mktemp -d)
   trap 'rm -rf "$META_DIR"' EXIT
   fetch_all_meta >/dev/null 2>&1 || exit 0
-  # With a lookup missing, the list is incomplete and proves nothing.
-  if compgen -G "$META_DIR/*.failed" >/dev/null; then exit 0; fi
+  if compgen -G "$META_DIR/*.failed" >/dev/null; then
+    # ipsw.me isn't answering. Once that has lasted FALLBACK_MINUTES, go by
+    # Apple's feed instead.
+    [[ -e "$IPSWME_DOWN_FILE" ]] || touch "$IPSWME_DOWN_FILE"
+    [[ -z "$(find "$IPSWME_DOWN_FILE" -mmin "-${FALLBACK_MINUTES}" 2>/dev/null)" ]] || exit 0
+    apple_fallback >/dev/null 2>&1 || exit 0
+    # With a lookup still missing, the list is incomplete and proves nothing.
+    if compgen -G "$META_DIR/*.failed" >/dev/null; then exit 0; fi
+  else
+    rm -f "$IPSWME_DOWN_FILE"
+  fi
   WANTED=$(wanted_urls)
 
   if [[ ! -f "$SYNCED_FILE" ]]; then
     REASON="First check since the container started"
   elif [[ "$WANTED" != "$(cat "$SYNCED_FILE")" ]]; then
-    REASON="New firmware on ipsw.me, or the phone selection changed"
+    REASON="New firmware out, or the phone selection changed"
   else
     exit 0
   fi
@@ -296,7 +372,7 @@ fi
 
 # Without a device list the cleanup step below would delete every IPSW.
 if (( ${#DEVICES[@]} == 0 )); then
-  finish 1 "❌ No devices to check (ipsw.me unreachable?) — stopping without changes."
+  finish 1 "❌ No devices to check (ipsw.me and Apple's feed unreachable?) — stopping without changes."
 fi
 
 log "📱 Checking ${#DEVICES[@]} iPhone devices — fetching firmware metadata..."
@@ -315,6 +391,10 @@ TMP_FILE=$(mktemp)
 PROGRESS_FILE="${TMPDIR:-/tmp}/ipsw-manager-download"
 
 fetch_all_meta
+apple_fallback
+if (( FALLBACK_USED > 0 )); then
+  log "⚠️  ipsw.me lookup failed for ${LOOKUPS_FAILED} phone(s) — using Apple's own firmware feed for ${FALLBACK_USED} of them."
+fi
 # Recorded before anything is downloaded, so a run that fails isn't started
 # again by every `--if-new` check (see RETRY_MINUTES).
 wanted_urls > "$ATTEMPTED_FILE" 2>/dev/null || true
@@ -332,7 +412,7 @@ wanted_urls > "$ATTEMPTED_FILE" 2>/dev/null || true
 # with a warning and never appears in the manifest.
 # ---------------------------------------------------------------------------
 
-declare -A URL_VERSION=() URL_SHA=() URL_SHA_ALGO=() URL_SIZE=() URL_DEVICES=()
+declare -A URL_VERSION=() URL_SHA=() URL_SHA_ALGO=() URL_SIZE=() URL_DEVICES=() URL_META=()
 
 for DEVICE in "${DEVICES[@]}"; do
   META_FILE="$META_DIR/$DEVICE"
@@ -351,24 +431,24 @@ for DEVICE in "${DEVICES[@]}"; do
   }
 
   VERSION=$(echo "$ENTRY" | jq -r '.version')
-  # Pick the configured algorithm; fall back to sha256 if the field is absent
-  SHA=$(echo "$ENTRY" | jq -r --arg algo "$CHECKSUM_ALGO" '
-    if $algo == "md5" then (.md5sum // .sha256sum // empty)
-    else (.sha256sum // .md5sum // empty)
-    end
-  ')
+  # Pick the configured algorithm; fall back to sha256 if the field is
+  # absent, then to sha1, which is all Apple's feed has.
   SHA_ALGO=$(echo "$ENTRY" | jq -r --arg algo "$CHECKSUM_ALGO" '
     if $algo == "md5" and .md5sum then "md5"
     elif .sha256sum then "sha256"
+    elif .md5sum then "md5"
+    elif .sha1sum then "sha1"
     else "none"
     end
   ')
+  SHA=$(echo "$ENTRY" | jq -r --arg algo "$SHA_ALGO" '.[$algo + "sum"] // empty')
   SIZE=$(echo "$ENTRY"    | jq -r '.filesize')
 
   URL_VERSION["$URL"]="$VERSION"
   URL_SHA["$URL"]="$SHA"
   URL_SHA_ALGO["$URL"]="$SHA_ALGO"
   URL_SIZE["$URL"]="$SIZE"
+  URL_META["$URL"]="$ENTRY"
 
   # Accumulate device names under this URL
   if [[ -n "${URL_DEVICES[$URL]+x}" ]]; then
@@ -381,9 +461,11 @@ done
 UNIQUE_COUNT=${#URL_DEVICES[@]}
 log "🗂  Deduplicated to $UNIQUE_COUNT unique firmware files (from ${#DEVICES[@]} device identifiers)"
 
-# Nothing signed found usually means the API calls failed — don't let the
-# cleanup step wipe the download folder on that basis.
+# Don't let the cleanup step wipe the download folder when nothing was found.
 if (( UNIQUE_COUNT == 0 )); then
+  if compgen -G "$META_DIR/*.failed" >/dev/null; then
+    finish 1 "❌ Couldn't look up firmware on ipsw.me or in Apple's feed — stopping without changes."
+  fi
   finish 0 "⚠️  No signed firmware found for the selected phones — skipping download and cleanup."
 fi
 
@@ -517,11 +599,20 @@ download_unique() {
     if [[ -f "$CACHE_FILE" ]]; then
       local CACHED_ALGO CACHED_HASH CACHED_SIZE ON_DISK
       read -r CACHED_ALGO CACHED_HASH CACHED_SIZE < "$CACHE_FILE"
-      if [[ "$CACHED_ALGO" == "$HASH_ALGO" && "${CACHED_HASH:--}" == "${EXPECTED_HASH:--}" ]]; then
+      # The entry can be for another algorithm than this run checks with:
+      # ipsw.me and Apple's feed publish different ones. Then it's compared
+      # with that algorithm's hash if the source has it. Apple's feed only
+      # has sha1, so a file verified against ipsw.me is kept on its size.
+      local KNOWN_HASH="${EXPECTED_HASH:--}" SOURCE=""
+      if [[ "$CACHED_ALGO" != "$HASH_ALGO" ]]; then
+        KNOWN_HASH=$(jq -r --arg a "$CACHED_ALGO" '.[$a + "sum"] // empty' <<< "${URL_META[$URL]}")
+        SOURCE=$(jq -r '.source // empty' <<< "${URL_META[$URL]}")
+      fi
+      if [[ "${CACHED_HASH:--}" == "$KNOWN_HASH" || ( -z "$KNOWN_HASH" && "$SOURCE" == apple ) ]]; then
         # A size check is cheap and catches a file that was cut short on the NAS.
         ON_DISK=$(file_size "$FILE_PATH")
         if [[ -z "$CACHED_SIZE" ]]; then
-          printf "%s %s %s\n" "$HASH_ALGO" "${EXPECTED_HASH:--}" "$ON_DISK" > "$CACHE_FILE"
+          printf "%s %s %s\n" "$CACHED_ALGO" "${CACHED_HASH:--}" "$ON_DISK" > "$CACHE_FILE"
           CACHED_SIZE="$ON_DISK"
         fi
         if [[ "$ON_DISK" == "$CACHED_SIZE" ]]; then
@@ -544,6 +635,12 @@ download_unique() {
 
   CURRENT_PARTIAL="$PARTIAL_PATH"
 
+  # Apple's feed has no file sizes. Ask the server, for the progress display.
+  if (( FILESIZE == 0 )); then
+    FILESIZE=$(curl -sIL --max-time 30 "$URL" 2>/dev/null \
+      | awk 'tolower($1) == "content-length:" { n = $2 } END { print n + 0 }') || FILESIZE=0
+  fi
+
   # Spawn a background poller that redraws the progress line every 0.5s by
   # reading the .partial file size. Killed as soon as curl exits.
   (
@@ -565,6 +662,7 @@ download_unique() {
   case "$HASH_ALGO" in
     md5)    HASH_CMD="md5sum" ;;
     sha256) HASH_CMD="sha256sum" ;;
+    sha1)   HASH_CMD="sha1sum" ;;
     *)      HASH_CMD="" ;;
   esac
 

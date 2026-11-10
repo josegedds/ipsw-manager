@@ -42,6 +42,7 @@ Or with Docker Compose: edit the volume path and settings in [`compose.yml`](com
 | --- | --- | --- |
 | `CHECK_INTERVAL` | `30` | Minutes between checks for new firmware, 1 to 60. `0` turns the checks off |
 | `CRON_SCHEDULE` | unset | Optional: also do a full run at fixed times (cron syntax, in `TZ`), e.g. `0 18 * * *` |
+| `IPSW_FALLBACK_MINUTES` | `120` | Minutes ipsw.me has to be unreachable before the checks go by Apple's own firmware feed instead. `0` switches straight away |
 | `IPSW_RETRY_MINUTES` | `60` | After a run that didn't finish cleanly, minutes the checks wait (from when it ended) before trying the same firmware again |
 | `TZ` | `UTC` | Time zone for `CRON_SCHEDULE`, e.g. `Europe/London` |
 | `PUID` / `PGID` | unset (root) | User and group to run as, so files on the NAS aren't owned by root. `PGID` defaults to `PUID` |
@@ -66,7 +67,14 @@ sudo chown -R 1000:1000 /path/to/ipsw
 
 **Access.** The web UI has no login, and anyone who can reach it can start runs and change the phone list. To make it reachable only from the host itself, publish the port on localhost: `-p 127.0.0.1:8080:8080`.
 
-**If ipsw.me is unreachable.** Lookups are retried. If any phone's lookup still fails, that run downloads what it can but skips the cleanup, so that phone's IPSW isn't deleted.
+**If ipsw.me is unreachable.** Lookups are retried. For any phone whose lookup still fails, the run uses Apple's own firmware feed instead (`s.mzstatic.com/version`, the list Finder reads when it restores a phone) and says so in the log. The feed has the current IPSW for every iPhone. Files already in the folder are kept, not downloaded again.
+
+- **Run Now** and `CRON_SCHEDULE` runs switch to Apple's feed straight away. The checks wait until ipsw.me has been unreachable for two hours (`IPSW_FALLBACK_MINUTES`). Apple's feed occasionally lists an older build for a phone than ipsw.me does, and switching over and back means downloading both, so a short outage is waited out.
+- Apple's feed has SHA-1 checksums only, so downloads made from it are verified with SHA-1 whatever `IPSW_CHECKSUM_ALGO` says. It has no file sizes, so the size is asked of the download server.
+- In the web UI, the phone list shows identifiers without names if it has never loaded from ipsw.me, and the calendar shows only the last few months of public releases, from Apple's developer feed.
+- If neither source answers for a phone, the run downloads what it can but skips the cleanup, so that phone's IPSW isn't deleted.
+
+**Downloads come from Apple only.** A firmware URL is used only if it is an `.ipsw` file on `apple.com` or `cdn-apple.com` (or a subdomain). Anything else is treated as a failed lookup and looked up in Apple's feed instead. ipsw.me supplies both the URL and the checksum, so without this a wrong or hijacked answer could put someone else's file in the folder and have the cleanup delete the real ones.
 
 **If a download fails.** The run carries on with the other phones but skips the cleanup, so a phone whose new firmware didn't download keeps its current IPSW. A download that stalls (under 1 KB/s for two minutes) is abandoned. The checks try again an hour later (`IPSW_RETRY_MINUTES`), or sooner if the firmware changes again, and so does **Run Now** or a `CRON_SCHEDULE` run.
 
