@@ -137,6 +137,48 @@ def extract_version(name):
     return m.group(1) if m else "—"
 
 
+FILE_IDENTIFIER_RE = re.compile(r"iPhone\d+,\d+")
+
+
+def extract_identifiers(name):
+    """Device identifiers at the start of an IPSW name, e.g. ["iPhone10,3", "iPhone10,6"]."""
+    return FILE_IDENTIFIER_RE.findall(name.split("_", 1)[0])
+
+
+def model_name(identifiers, names):
+    """Marketing name for a firmware's devices, e.g. "iPhone X".
+
+    One IPSW often covers regional variants ("iPhone X (GSM)", "iPhone X (Global)"),
+    so with several identifiers the bracketed suffixes are dropped and duplicates merged.
+    """
+    found = [names[i] for i in identifiers if i in names]
+    if not found:
+        return None
+    if len(identifiers) > 1:
+        found = [re.sub(r"\s*\(.*?\)", "", n).strip() for n in found]
+    return " / ".join(dict.fromkeys(found))
+
+
+def device_names():
+    """identifier -> name from the cached ipsw.me list, without blocking on the network.
+
+    If the cache is empty or stale, refresh it in the background for the next poll.
+    """
+    devices = _device_cache["devices"]
+    if (not devices or time.time() - _device_cache["at"] >= DEVICE_CACHE_TTL) \
+            and _device_lock.acquire(blocking=False):
+        _device_lock.release()
+
+        def refresh():
+            try:
+                get_all_iphones()
+            except Exception as exc:
+                print(f"WARN: couldn't fetch device names from ipsw.me: {exc}", flush=True)
+
+        threading.Thread(target=refresh, daemon=True).start()
+    return {d["identifier"]: d["name"] for d in devices}
+
+
 def download_speed(name, size):
     """Bytes per second for a .partial file, from the sizes seen as the UI polls.
 
@@ -198,6 +240,7 @@ def get_downloads():
             results.append(
                 {
                     "name": path.name,
+                    "identifiers": extract_identifiers(path.name),
                     "size": stat.st_size,
                     "size_human": format_size(stat.st_size),
                     "mtime": datetime.fromtimestamp(
@@ -228,6 +271,7 @@ def get_downloads():
             results.append(
                 {
                     "name": ipsw_name,
+                    "identifiers": extract_identifiers(ipsw_name),
                     "size": stat.st_size,
                     "size_human": format_size(stat.st_size),
                     "mtime": None,
@@ -490,6 +534,7 @@ th{padding:9px 16px;text-align:left;color:#8b949e;font-weight:500;border-bottom:
 td{padding:10px 16px;border-bottom:1px solid #21262d;vertical-align:middle}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:rgba(255,255,255,.025)}
+.model{cursor:help;font-weight:500}
 .mono{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:12px}
 .speed{display:block;color:#58a6ff;font-size:11px;margin-top:2px}
 .bar{height:4px;width:160px;max-width:100%;background:#21262d;border-radius:2px;margin-top:5px;overflow:hidden}
@@ -563,7 +608,8 @@ tr:hover td{background:rgba(255,255,255,.025)}
     <table>
       <thead>
         <tr>
-          <th>Filename</th>
+          <th>Model</th>
+          <th>Identifier</th>
           <th>iOS</th>
           <th>Size</th>
           <th>Modified</th>
@@ -571,7 +617,7 @@ tr:hover td{background:rgba(255,255,255,.025)}
         </tr>
       </thead>
       <tbody id="files-body">
-        <tr><td colspan="5" class="empty">Loading…</td></tr>
+        <tr><td colspan="6" class="empty">Loading…</td></tr>
       </tbody>
     </table>
   </div>
@@ -657,7 +703,7 @@ async function refresh() {
 
   const tbody = document.getElementById("files-body");
   if (!d.downloads.length) {
-    tbody.innerHTML = '<tr><td colspan="5" class="empty">No IPSW files found in ' + d.download_dir + '</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">No IPSW files found in ' + d.download_dir + '</td></tr>';
   } else {
     tbody.innerHTML = d.downloads.map(f => {
       const badge = f.status === "downloading"
@@ -666,7 +712,8 @@ async function refresh() {
           ? '<span class="badge badge-green">✓ Verified</span>'
           : '<span class="badge badge-orange">? Unverified</span>';
       return '<tr>'
-        + '<td class="mono">' + f.name + '</td>'
+        + '<td class="model" title="' + esc(f.name) + '">' + esc(f.model || f.identifiers.join(", ") || f.name) + '</td>'
+        + '<td class="mono">' + esc(f.identifiers.join(", ") || "—") + '</td>'
         + '<td>' + (f.version !== "—" ? 'iOS ' + f.version : f.version) + '</td>'
         + '<td class="mono">' + f.size_human + (f.total_human ? ' of ' + f.total_human : '') + speedLabel(f) + '</td>'
         + '<td style="color:#8b949e">' + fmt(f.mtime) + '</td>'
@@ -923,6 +970,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/status":
             running = is_manager_running()
             downloads = _with_timeout(get_downloads, fallback=[])
+            names = device_names()
+            for f in downloads:
+                f["model"] = model_name(f["identifiers"], names)
             logs = _with_timeout(get_log_tail, 200, fallback=["[log unavailable — mount may be offline]"])
             last_run = get_last_run(logs, running)
             self.send_json(
