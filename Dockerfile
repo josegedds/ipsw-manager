@@ -14,7 +14,7 @@ RUN apk add --no-cache \
     tini \
     tzdata
 
-COPY --chmod=755 ipsw-manager.sh webui.py /usr/local/bin/
+COPY --chmod=755 ipsw-manager.sh ipsw-verify.py webui.py /usr/local/bin/
 COPY --chmod=755 entrypoint.sh /entrypoint.sh
 
 # By default ipsw.me is checked every 30 minutes and a run starts when the
@@ -26,7 +26,8 @@ ENV CHECK_INTERVAL=30 \
     CRON_SCHEDULE=${CRON_SCHEDULE} \
     TZ=UTC \
     IPSW_DOWNLOAD_DIR=/downloads \
-    IPSW_CHECKSUM_ALGO=md5 \
+    IPSW_CHECKSUM_ALGO=sha256 \
+    IPSW_REVERIFY_DAYS=30 \
     WEBUI_PORT=8080 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

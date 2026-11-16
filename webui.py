@@ -47,6 +47,9 @@ SPEED_WINDOW = 15  # seconds of .partial size samples used to work out download 
 # Written by ipsw-manager.sh while it downloads: file name, then expected bytes.
 STATE_DIR = os.environ.get("TMPDIR", "/tmp")
 PROGRESS_FILE = os.path.join(STATE_DIR, "ipsw-manager-download")
+# Written by ipsw-verify.py while it reads a stored file back to check it:
+# JSON with the file name, bytes read so far, the total and the read speed.
+VERIFY_PROGRESS_FILE = os.path.join(STATE_DIR, "ipsw-manager-verify")
 # Also written by ipsw-manager.sh, inside the container so they're readable
 # when the NAS isn't: the last run's outcome, and the start time of a run
 # that hasn't finished (left behind if it was killed).
@@ -208,6 +211,55 @@ def read_expected_size():
         return None, 0
 
 
+def read_verify_progress():
+    """What ipsw-verify.py is reading back right now, or None."""
+    try:
+        state = json.loads(Path(VERIFY_PROGRESS_FILE).read_text(encoding="utf-8"))
+        total = int(state["total"])
+        done = int(state["done"])
+        speed = state.get("speed")
+        return {
+            "name": str(state["name"]),
+            "percent": min(100.0, done * 100 / total) if total > 0 else None,
+            "speed": speed,
+            "speed_human": format_size(speed) + "/s" if isinstance(speed, (int, float)) else None,
+            "eta_human": format_duration((total - done) / speed) + " left"
+            if isinstance(speed, (int, float)) and speed > 0 and total > done else None,
+            "total_human": None,
+        }
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+_cache_entries = {}  # hash cache file name -> (its mtime, parsed entry)
+
+
+def read_cache_entry(cache):
+    """(size in bytes, Unix time checked) from a hash cache file.
+
+    None if the file isn't there or predates the read-back check: those
+    entries only recorded the download's checksum, not the stored copy's.
+    The cache is on the NAS, so each file is only read again when it changes.
+    """
+    try:
+        mtime = cache.stat().st_mtime_ns
+    except OSError:
+        _cache_entries.pop(cache.name, None)
+        return None
+    known = _cache_entries.get(cache.name)
+    if known and known[0] == mtime:
+        return known[1]
+    entry = None
+    try:
+        fields = cache.read_text(encoding="utf-8").split()
+        if len(fields) >= 5 and fields[0] == "v2":
+            entry = (int(fields[3]), int(fields[4]))
+    except (OSError, ValueError):
+        pass
+    _cache_entries[cache.name] = (mtime, entry)
+    return entry
+
+
 def format_duration(seconds):
     seconds = int(seconds)
     if seconds < 60:
@@ -230,27 +282,35 @@ def get_downloads():
     download_path = Path(DOWNLOAD_DIR)
     cache_path = Path(HASH_CACHE_DIR)
 
+    verifying = read_verify_progress()
+
     try:
         for path in sorted(download_path.glob("*.ipsw")):
             try:
                 stat = path.stat()
             except OSError:
                 continue
-            cache = cache_path / (path.name + ".hash")
-            results.append(
-                {
-                    "name": path.name,
-                    "identifiers": extract_identifiers(path.name),
-                    "size": stat.st_size,
-                    "size_human": format_size(stat.st_size),
-                    "mtime": datetime.fromtimestamp(
-                        stat.st_mtime, tz=timezone.utc
-                    ).isoformat(),
-                    "status": "complete",
-                    "verified": cache.exists(),
-                    "version": extract_version(path.name),
-                }
-            )
+            # Verified means the copy here was read back and matched, and is
+            # still the size it was then.
+            entry = read_cache_entry(cache_path / (path.name + ".hash"))
+            verified = entry is not None and entry[0] == stat.st_size
+            item = {
+                "name": path.name,
+                "identifiers": extract_identifiers(path.name),
+                "size": stat.st_size,
+                "size_human": format_size(stat.st_size),
+                "mtime": datetime.fromtimestamp(
+                    stat.st_mtime, tz=timezone.utc
+                ).isoformat(),
+                "status": "complete",
+                "verified": verified,
+                "checked": datetime.fromtimestamp(entry[1], tz=timezone.utc).isoformat()
+                if verified else None,
+                "version": extract_version(path.name),
+            }
+            if verifying and verifying["name"] == path.name:
+                item.update(verifying, name=path.name, status="verifying")
+            results.append(item)
     except OSError:
         pass
 
@@ -268,23 +328,25 @@ def get_downloads():
             total = expected_size if ipsw_name == expected_name and expected_size > 0 else None
             percent = min(100.0, stat.st_size * 100 / total) if total else None
             eta = (total - stat.st_size) / speed if total and speed and speed > 0 else None
-            results.append(
-                {
-                    "name": ipsw_name,
-                    "identifiers": extract_identifiers(ipsw_name),
-                    "size": stat.st_size,
-                    "size_human": format_size(stat.st_size),
-                    "mtime": None,
-                    "status": "downloading",
-                    "verified": False,
-                    "version": extract_version(ipsw_name),
-                    "speed": speed,
-                    "speed_human": format_size(speed) + "/s" if speed is not None else None,
-                    "total_human": format_size(total) if total else None,
-                    "percent": percent,
-                    "eta_human": format_duration(max(eta, 0)) + " left" if eta is not None else None,
-                }
-            )
+            item = {
+                "name": ipsw_name,
+                "identifiers": extract_identifiers(ipsw_name),
+                "size": stat.st_size,
+                "size_human": format_size(stat.st_size),
+                "mtime": None,
+                "status": "downloading",
+                "verified": False,
+                "version": extract_version(ipsw_name),
+                "speed": speed,
+                "speed_human": format_size(speed) + "/s" if speed is not None else None,
+                "total_human": format_size(total) if total else None,
+                "percent": percent,
+                "eta_human": format_duration(max(eta, 0)) + " left" if eta is not None else None,
+            }
+            # Downloaded, and now being read back before it gets its final name.
+            if verifying and verifying["name"] == ipsw_name:
+                item.update(verifying, name=ipsw_name, status="verifying")
+            results.append(item)
     except OSError:
         pass
     forget_speeds(partials)
@@ -292,7 +354,7 @@ def get_downloads():
     return results
 
 
-def trigger_run(clear_cache=False):
+def trigger_run(reverify=False):
     if is_manager_running():
         return False, "Already running"
     if not _run_lock.acquire(blocking=False):
@@ -300,14 +362,10 @@ def trigger_run(clear_cache=False):
 
     def run():
         try:
-            if clear_cache:
-                try:
-                    for f in Path(HASH_CACHE_DIR).glob("*.hash"):
-                        f.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            # --reverify reads every stored file back and checks it; only
+            # the ones that fail are downloaded again.
             subprocess.run(
-                ["/usr/local/bin/ipsw-manager.sh"],
+                ["/usr/local/bin/ipsw-manager.sh"] + (["--reverify"] if reverify else []),
                 start_new_session=True,
             )
         finally:
@@ -708,9 +766,11 @@ async function refresh() {
     tbody.innerHTML = d.downloads.map(f => {
       const badge = f.status === "downloading"
         ? '<span class="badge badge-blue">⬇ Downloading</span>'
-        : f.verified
-          ? '<span class="badge badge-green">✓ Verified</span>'
-          : '<span class="badge badge-orange">? Unverified</span>';
+        : f.status === "verifying"
+          ? '<span class="badge badge-blue" title="Reading the stored file back and checking it against its checksum">🔍 Verifying</span>'
+          : f.verified
+            ? '<span class="badge badge-green" title="The copy in the download folder was read back and matched its checksum on ' + esc(fmt(f.checked)) + '">✓ Verified</span>'
+            : '<span class="badge badge-orange" title="Not yet read back from the download folder and checked. The next run, or Re-verify, will do it.">? Not checked</span>';
       return '<tr>'
         + '<td class="model" title="' + esc(f.name) + '">' + esc(f.model || f.identifiers.join(", ") || f.name) + '</td>'
         + '<td class="mono">' + esc(f.identifiers.join(", ") || "—") + '</td>'
@@ -733,7 +793,7 @@ async function refresh() {
 }
 
 function speedLabel(f) {
-  if (f.status !== "downloading") return "";
+  if (f.status !== "downloading" && f.status !== "verifying") return "";
   const parts = [];
   if (f.percent != null) parts.push(Math.floor(f.percent) + "%");
   parts.push(f.speed_human || "measuring…");
@@ -744,9 +804,9 @@ function speedLabel(f) {
   return bar + '<span class="speed">' + parts.join(" · ") + '</span>';
 }
 
-async function doRun(clearCache) {
-  if (clearCache && !confirm(
-    "Re-verify will clear the hash cache and re-download all firmware files to re-verify checksums.\\n\\nThis may take a long time. Continue?"
+async function doRun(reverify) {
+  if (reverify && !confirm(
+    "Re-verify reads every firmware file back from the download folder and checks it against its checksum. Any that fail are downloaded again.\\n\\nOver gigabit Ethernet this takes a minute or two per file. Continue?"
   )) return;
 
   document.getElementById("btn-run").disabled = true;
@@ -757,7 +817,7 @@ async function doRun(clearCache) {
     d = await (await fetch("/api/run", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({clear_cache: clearCache})
+      body: JSON.stringify({reverify: reverify})
     })).json();
   } catch (e) {
     alert("Request failed: " + e);
@@ -1015,7 +1075,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             data = {}
         if self.path == "/api/run":
-            ok, msg = trigger_run(bool(data.get("clear_cache", False)))
+            ok, msg = trigger_run(bool(data.get("reverify", False)))
             self.send_json({"success": ok, "message": msg})
         elif self.path == "/api/devices":
             selected = data.get("devices") if isinstance(data, dict) else None
