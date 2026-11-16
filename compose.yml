@@ -22,8 +22,26 @@ services:
       # The download folder must be writable by them. Remove both to run as root.
       PUID: "1000"
       PGID: "1000"
-      # md5 or sha256
-      IPSW_CHECKSUM_ALGO: md5
+      # sha256 or md5
+      IPSW_CHECKSUM_ALGO: sha256
+      # Read each stored file back and check it again this often (days).
+      # 0 checks a file only when it's downloaded.
+      IPSW_REVERIFY_DAYS: "30"
     volumes:
       # Where the IPSWs, the log and the phone selection are kept.
       - /path/to/ipsw:/downloads
+      # On Docker Desktop for Windows with the files on a NAS, use the volume
+      # below instead of a mapped drive or \\nas\share path (see the README):
+      # - ipsw:/downloads
+
+# A NAS share mounted by Docker itself over SMB. Docker then talks to the NAS
+# directly, rather than through Windows' file sharing, so the files that are
+# checked are the ones on the NAS. Use the NAS's IP address, and make uid/gid
+# match PUID/PGID above.
+# volumes:
+#   ipsw:
+#     driver: local
+#     driver_opts:
+#       type: cifs
+#       device: "//192.168.1.10/ipsw"
+#       o: "addr=192.168.1.10,username=USER,password=PASSWORD,vers=3.0,uid=1000,gid=1000,file_mode=0664,dir_mode=0775"

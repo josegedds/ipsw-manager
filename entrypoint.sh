@@ -39,7 +39,8 @@ fi
 
 # Forget what the last container run saw, so the first check after a start
 # or restart does a run and confirms the folder is up to date.
-rm -f "${TMPDIR:-/tmp}/ipsw-manager-synced" "${TMPDIR:-/tmp}/ipsw-manager-attempted"
+rm -f "${TMPDIR:-/tmp}/ipsw-manager-synced" "${TMPDIR:-/tmp}/ipsw-manager-attempted" \
+  "${TMPDIR:-/tmp}/ipsw-manager-reverify-due" "${TMPDIR:-/tmp}/ipsw-manager-verify"
 
 # Optional PUID/PGID: run everything as that user so files on the NAS aren't
 # owned by root. ipsw-manager.sh does the same switch for `docker exec` runs.
@@ -65,6 +66,11 @@ fi
 echo "🐳 ipsw-manager container started (Alpine $(cat /etc/alpine-release))"
 echo "   Download dir : ${IPSW_DOWNLOAD_DIR}"
 echo "   Checksum algo: ${IPSW_CHECKSUM_ALGO}"
+if [[ "${IPSW_REVERIFY_DAYS:-30}" == 0 ]]; then
+  echo "   Stored files : checked when downloaded, not again after that"
+else
+  echo "   Stored files : read back and checked every ${IPSW_REVERIFY_DAYS:-30} days"
+fi
 if [[ -n "$CHECK_INTERVAL" ]]; then
   echo "   New firmware : checked every ${CHECK_INTERVAL} min, run when it changes"
 else

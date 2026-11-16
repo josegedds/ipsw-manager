@@ -25,17 +25,28 @@ fi
 # Environment variables — all have sensible defaults so the script
 # works both inside Docker and standalone.
 DOWNLOAD_DIR="${IPSW_DOWNLOAD_DIR:-$PWD/ipsw}"
-CHECKSUM_ALGO="${IPSW_CHECKSUM_ALGO:-md5}"   # md5 or sha256
+CHECKSUM_ALGO="${IPSW_CHECKSUM_ALGO:-sha256}"   # sha256 or md5
 API_DEVICES="https://api.ipsw.me/v4/devices"
 API_BASE="https://api.ipsw.me/v4/device"
 LOG_FILE="${DOWNLOAD_DIR}/ipsw-manager.log"
 # Phones picked in the web UI, as a JSON array of identifiers. If it doesn't
 # exist yet, every iPhone 11 and newer is downloaded.
 SELECTION_FILE="${IPSW_SELECTION_FILE:-${DOWNLOAD_DIR}/selected-devices.json}"
-# Hash cache — avoids re-reading whole IPSWs from the NAS on later runs.
+# Hash cache — a record, per IPSW, of when the copy in the download folder
+# was last read back and found good, so runs in between needn't read it again.
 # Kept next to the downloads by default so it survives container updates.
-# Stored as <filename>.hash, one line: "<algo> <hash> <size in bytes>"
+# Stored as <filename>.hash (see write_cache for the format).
 HASH_CACHE_DIR="${IPSW_HASH_CACHE_DIR:-${DOWNLOAD_DIR}/.hash-cache}"
+# A stored file is read back and checked again once its last check is this
+# many days old, which catches one that has gone bad on the NAS since. 0
+# turns that off; `--reverify` checks every file now.
+REVERIFY_DAYS="${IPSW_REVERIFY_DAYS:-30}"
+[[ "$REVERIFY_DAYS" =~ ^[0-9]+$ ]] || REVERIFY_DAYS=30
+# Reads a stored file back and checks it (see the top of that file).
+VERIFY_HELPER="${IPSW_VERIFY_HELPER:-$(dirname "$0")/ipsw-verify.py}"
+# A read from the download folder that returns nothing for this many seconds
+# is given up on.
+VERIFY_STALL=300
 # Marks the download folder as the real one (see check_download_dir).
 MARKER_FILE="${DOWNLOAD_DIR}/.ipsw-manager"
 
@@ -49,6 +60,11 @@ RUN_STARTED_FILE="${STATE_DIR}/ipsw-manager-run-started"   # removed when a run 
 # at the last run that got as far as looking. `--if-new` compares against them.
 SYNCED_FILE="${STATE_DIR}/ipsw-manager-synced"
 ATTEMPTED_FILE="${STATE_DIR}/ipsw-manager-attempted"
+# When the stored files are next due a check (Unix time), written by a clean
+# run. `--if-new` starts a run then, without having to look at the NAS.
+REVERIFY_DUE_FILE="${STATE_DIR}/ipsw-manager-reverify-due"
+# What the helper is reading back and how far it has got, for the web UI.
+VERIFY_PROGRESS_FILE="${STATE_DIR}/ipsw-manager-verify"
 # After a run that didn't finish cleanly, `--if-new` waits this many minutes
 # (counted from when the run ended) before trying the same firmware again.
 RETRY_MINUTES="${IPSW_RETRY_MINUTES:-60}"
@@ -129,7 +145,14 @@ wanted_urls() {
 # "run when a new iOS version is out" means asking often; this is the cheap
 # way to ask. It only talks to ipsw.me, reads nothing from the NAS beyond the
 # phone selection, and writes nothing to the log unless it starts a run.
+# It also starts one when the stored files are due to be checked again.
 # ---------------------------------------------------------------------------
+
+recheck_due() {
+  local DUE
+  DUE=$(cat "$REVERIFY_DUE_FILE" 2>/dev/null) || return 1
+  [[ "$DUE" =~ ^[0-9]+$ ]] && (( $(date +%s) >= DUE ))
+}
 
 if [[ "${1:-}" == "--if-new" ]]; then
   if command -v flock &>/dev/null; then
@@ -156,6 +179,8 @@ if [[ "${1:-}" == "--if-new" ]]; then
     REASON="First check since the container started"
   elif [[ "$WANTED" != "$(cat "$SYNCED_FILE")" ]]; then
     REASON="New firmware on ipsw.me, or the phone selection changed"
+  elif recheck_due; then
+    REASON="The stored firmware is due to be checked again"
   else
     exit 0
   fi
@@ -179,6 +204,11 @@ fi
 # since the log on the NAS may be unreachable.
 # ---------------------------------------------------------------------------
 
+# `ipsw-manager.sh --reverify` (the web UI's Re-verify): read every stored
+# file back and check it, however recently it was last checked.
+FORCE_REVERIFY=0
+[[ "${1:-}" == "--reverify" ]] && FORCE_REVERIFY=1
+
 RESULT=""          # one-line outcome, set by finish()
 ABORTED_AT=""      # set by the ERR trap: the command that failed
 LOG_READY=0        # the download folder checked out, so the log may be written
@@ -197,7 +227,7 @@ on_exit() {
   set +e        # finish cleaning up whatever fails here
   trap - ERR
   [[ -n "$POLLER_PID" ]] && kill "$POLLER_PID" 2>/dev/null
-  rm -f "${TMP_FILE:-}" "${PROGRESS_FILE:-}" "${CURL_ERR:-}"
+  rm -f "${TMP_FILE:-}" "${PROGRESS_FILE:-}" "${CURL_ERR:-}" "$VERIFY_PROGRESS_FILE"
   [[ -n "${META_DIR:-}" ]] && rm -rf "$META_DIR"
 
   if [[ -n "$ABORTED_AT" ]]; then
@@ -286,6 +316,12 @@ fi
 timestamp > "$RUN_STARTED_FILE"
 
 [[ -n "${_IPSW_REASON:-}" ]] && log "🆕 ${_IPSW_REASON} — starting a run."
+(( FORCE_REVERIFY )) && log "🔍 Re-verify — every stored file will be read back and checked."
+
+# Nothing can be marked verified without it, so don't start.
+if [[ ! -f "$VERIFY_HELPER" ]] || ! command -v python3 &>/dev/null; then
+  finish 1 "❌ Can't check files: needs python3 and ${VERIFY_HELPER} — stopping without changes."
+fi
 
 load_devices
 if [[ "$DEVICES_FROM" == selection ]]; then
@@ -324,7 +360,8 @@ wanted_urls > "$ATTEMPTED_FILE" 2>/dev/null || true
 #
 # Keyed on URL, we accumulate:
 #   URL_VERSION  — iOS version string
-#   URL_SHA      — expected SHA256
+#   URL_SHA      — expected checksum, or "-" if ipsw.me doesn't give one
+#   URL_SHA_ALGO — md5 or sha256; "zip" (test the archive) without a checksum
 #   URL_SIZE     — file size in bytes
 #   URL_DEVICES  — all device identifiers sharing this URL, joined with " + "
 #
@@ -364,6 +401,11 @@ for DEVICE in "${DEVICES[@]}"; do
     end
   ')
   SIZE=$(echo "$ENTRY"    | jq -r '.filesize')
+  if [[ -z "$SHA" || "$SHA" == "null" || "$SHA_ALGO" == "none" ]]; then
+    SHA="-"
+    SHA_ALGO="zip"
+  fi
+  SHA="${SHA,,}"
 
   URL_VERSION["$URL"]="$VERSION"
   URL_SHA["$URL"]="$SHA"
@@ -387,58 +429,85 @@ if (( UNIQUE_COUNT == 0 )); then
   finish 0 "⚠️  No signed firmware found for the selected phones — skipping download and cleanup."
 fi
 
-# Phase 2: verify / download each unique URL one at a time.
+# Phase 2: check / download each unique URL one at a time.
 #
-# A background subshell polls the .partial file size every 0.5s and redraws
-# a single progress line in place using \r — no curl progress parsing needed.
+# A file counts as verified only once the copy in the download folder has been
+# read back and matched its checksum. Hashing the download as it arrives
+# proves what curl received, not what reached the NAS: a write that is dropped
+# or damaged on the way leaves a file of the right size with the wrong
+# contents. So:
+#
+#   - a new download is hashed as it arrives, then read back and hashed again
+#     before it's given its final name;
+#   - a file already there with no record of such a check is read back rather
+#     than downloaded again, and so is one whose check is REVERIFY_DAYS old;
+#   - only a file that fails the check is deleted and downloaded again.
+#
+# Reading back is done by ipsw-verify.py, which bypasses this machine's cache
+# and gives up on a read that stalls.
 # ---------------------------------------------------------------------------
 
-verify_checksum() {
-  local FILE_PATH="$1"
-  local EXPECTED_HASH="$2"
-  local ALGO="$3"   # "md5" or "sha256"
+# Prints a line and adds it to the log.
+note() {
+  printf "%s\n" "$1"
+  printf "%s  %s\n" "$(timestamp)" "$1" >> "$LOG_FILE"
+}
 
-  if [[ -z "$EXPECTED_HASH" || "$EXPECTED_HASH" == "null" || "$ALGO" == "none" ]]; then
-    echo "⚠️  No checksum available for $(basename "$FILE_PATH"), skipping verification"
-    return 0
+# Records that a stored file was read back and found good. One line:
+#   v2 <algo> <hash> <size in bytes> <when checked, Unix time>
+# Entries from before "v2" recorded the download's hash only, so they don't
+# count and the file is checked on the next run.
+write_cache() {
+  local CACHE_FILE="$1" ALGO="$2" HASH="$3" SIZE="$4"
+  printf "v2 %s %s %s %s\n" "$ALGO" "$HASH" "$SIZE" "$(date +%s)" > "$CACHE_FILE"
+}
+
+# The oldest check among the files kept, for REVERIFY_DUE_FILE.
+OLDEST_CHECK=0
+track_checked() {
+  if (( OLDEST_CHECK == 0 || $1 < OLDEST_CHECK )); then OLDEST_CHECK="$1"; fi
+}
+
+days_ago() {
+  local DAYS=$(( ($(date +%s) - $1) / 86400 ))
+  if (( DAYS <= 0 )); then echo "today"
+  elif (( DAYS == 1 )); then echo "yesterday"
+  else echo "$DAYS days ago"
   fi
+}
 
-  local ACTUAL_HASH
-  case "$ALGO" in
-    md5)
-      if command -v md5sum &>/dev/null; then
-        ACTUAL_HASH=$(md5sum "$FILE_PATH" | awk '{print $1}')
-      elif command -v md5 &>/dev/null; then
-        ACTUAL_HASH=$(md5 -q "$FILE_PATH")   # macOS
-      else
-        echo "⚠️  No md5 utility found, skipping checksum verification"
-        return 0
-      fi
-      ;;
-    sha256)
-      if command -v sha256sum &>/dev/null; then
-        ACTUAL_HASH=$(sha256sum "$FILE_PATH" | awk '{print $1}')
-      elif command -v shasum &>/dev/null; then
-        ACTUAL_HASH=$(shasum -a 256 "$FILE_PATH" | awk '{print $1}')
-      else
-        echo "⚠️  No sha256 utility found, skipping checksum verification"
-        return 0
-      fi
-      ;;
-    *)
-      echo "⚠️  Unknown checksum algorithm '$ALGO', skipping verification"
-      return 0
-      ;;
-  esac
+# Reads a file back from the download folder and checks it. Sets:
+#   V_STATUS  ok, reread-ok, mismatch, unstable or unreadable
+#   V_HASH    the checksum it read ("-" if none)
+#   V_INFO    read speed, or what went wrong
+check_on_disk() {
+  local FILE_PATH="$1" NAME="$2" EXPECTED_HASH="$3" ALGO="$4"
+  local OUT RC=0
+  # Without the run lock (fd 9), so a helper stuck on the NAS can't hold it.
+  OUT=$(python3 "$VERIFY_HELPER" --algo "$ALGO" --expect "$EXPECTED_HASH" --name "$NAME" \
+        --progress "$VERIFY_PROGRESS_FILE" --stall "$VERIFY_STALL" "$FILE_PATH" 9>&-) || RC=$?
+  rm -f "$VERIFY_PROGRESS_FILE"
+  V_STATUS="" V_HASH="" V_INFO=""
+  read -r V_STATUS V_HASH V_INFO <<< "$OUT" || true
+  if [[ -z "$V_STATUS" ]]; then
+    V_STATUS="unreadable"
+    V_INFO="the check stopped unexpectedly (status $RC)"
+  fi
+}
 
-  if [[ "$ACTUAL_HASH" == "$EXPECTED_HASH" ]]; then
-    return 0
+# How a file that passed was checked, for the log.
+checked_how() {
+  if [[ "$1" == "zip" ]]; then
+    echo "no checksum on ipsw.me, so tested as an archive, read back at $V_INFO"
   else
-    printf "\n❌ Checksum mismatch for %s (%s)\n" "$(basename "$FILE_PATH")" "$ALGO"
-    printf "   Expected: %s\n" "$EXPECTED_HASH"
-    printf "   Got:      %s\n" "$ACTUAL_HASH"
-    return 1
+    echo "$1, read back at $V_INFO"
   fi
+}
+
+# One read came back wrong and the next one right: the file is fine, the
+# path to it isn't.
+warn_reread() {
+  note "⚠️  [$1]: The first read of $2 came back wrong and the second was right — reads from the download folder are unreliable. Check the network connection to the NAS."
 }
 
 draw_progress() {
@@ -478,14 +547,15 @@ file_size() {
 # A download that fails keeps the phone's current IPSW: any failure skips
 # the cleanup step, which would otherwise delete it.
 DOWNLOAD_FAILURES=0
+# Stored files that couldn't be read back to check. They're left alone.
+CHECK_FAILURES=0
 
 download_failed() {
   local LABEL="$1" VERSION="$2" REASON="$3"
   rm -f "$CURRENT_PARTIAL"
   CURRENT_PARTIAL=""
   (( DOWNLOAD_FAILURES++ )) || true
-  printf "❌ [%s]: %s (iOS %s)\n" "$LABEL" "$REASON" "$VERSION"
-  printf "%s  ❌ [%s]: %s (iOS %s)\n" "$(timestamp)" "$LABEL" "$REASON" "$VERSION" >> "$LOG_FILE"
+  note "❌ [$LABEL]: $REASON (iOS $VERSION)"
 }
 
 # Give up on a download that slows to under 1 KB/s for two minutes, rather
@@ -506,41 +576,7 @@ download_unique() {
   FILE_PATH="$DOWNLOAD_DIR/$FILE_NAME"
   PARTIAL_PATH="${FILE_PATH}.partial"
 
-  echo "$FILE_NAME" >> "$TMP_FILE"
-
   local CACHE_FILE="$HASH_CACHE_DIR/${FILE_NAME}.hash"
-
-  if [[ -f "$FILE_PATH" ]]; then
-    # Check the cache first — avoids reading the whole file back from the NAS.
-    # Cache entry format: "<algo> <hash> <size>". The hash is "-" when there
-    # was none to check, and entries from older versions have no size.
-    if [[ -f "$CACHE_FILE" ]]; then
-      local CACHED_ALGO CACHED_HASH CACHED_SIZE ON_DISK
-      read -r CACHED_ALGO CACHED_HASH CACHED_SIZE < "$CACHE_FILE"
-      if [[ "$CACHED_ALGO" == "$HASH_ALGO" && "${CACHED_HASH:--}" == "${EXPECTED_HASH:--}" ]]; then
-        # A size check is cheap and catches a file that was cut short on the NAS.
-        ON_DISK=$(file_size "$FILE_PATH")
-        if [[ -z "$CACHED_SIZE" ]]; then
-          printf "%s %s %s\n" "$HASH_ALGO" "${EXPECTED_HASH:--}" "$ON_DISK" > "$CACHE_FILE"
-          CACHED_SIZE="$ON_DISK"
-        fi
-        if [[ "$ON_DISK" == "$CACHED_SIZE" ]]; then
-          printf "✅ [%s]: Already verified via cache (iOS %s)\n" "$LABEL" "$VERSION"
-          printf "%s  ✅ [%s]: Already verified via cache (iOS %s)\n" "$(timestamp)" "$LABEL" "$VERSION" >> "$LOG_FILE"
-          return
-        fi
-        printf "⚠️  [%s]: %s is %s bytes but was %s when verified — re-downloading\n" \
-          "$LABEL" "$FILE_NAME" "$ON_DISK" "$CACHED_SIZE"
-        printf "%s  ⚠️  [%s]: %s changed size since it was verified — re-downloading\n" \
-          "$(timestamp)" "$LABEL" "$FILE_NAME" >> "$LOG_FILE"
-      fi
-    fi
-    # No valid cache entry — file exists but we haven't seen it before
-    # (e.g. first run after an upgrade, or cache was cleared).
-    # Re-download rather than reading the whole file back from the NAS.
-    printf "🔄 [%s]: No valid cache entry — re-downloading iOS %s\n" "$LABEL" "$VERSION"
-    rm -f "$FILE_PATH" "$CACHE_FILE"
-  fi
 
   CURRENT_PARTIAL="$PARTIAL_PATH"
 
@@ -558,9 +594,8 @@ download_unique() {
   printf '%s\n%s\n' "$FILE_NAME" "$FILESIZE" > "$PROGRESS_FILE"
 
   # Stream curl output through tee into the hash utility simultaneously.
-  # This computes the checksum during the download rather than re-reading
-  # the file from the NAS afterwards — avoids a full second pass over the
-  # network and eliminates the timeout issue on slow mounts.
+  # This shows whether the download itself arrived intact; the saved copy
+  # is checked separately below.
   local HASH_CMD
   case "$HASH_ALGO" in
     md5)    HASH_CMD="md5sum" ;;
@@ -574,7 +609,7 @@ download_unique() {
   # stderr, so the file on the NAS can be checked against it.
   CURL_ERR=$(mktemp)   # global, so on_exit can remove it
 
-  if [[ -n "$HASH_CMD" && -n "$EXPECTED_HASH" && "$EXPECTED_HASH" != "null" ]]; then
+  if [[ -n "$HASH_CMD" ]]; then
     # tee keeps passing data on after a failed write, so the hash can still
     # match; pipefail makes the write failure fail the download.
     ACTUAL_HASH=$(set -o pipefail; curl "${CURL_DOWNLOAD_OPTS[@]}" \
@@ -608,17 +643,16 @@ download_unique() {
   draw_progress "$LABEL" "$VERSION" "$FILESIZE" "$FILESIZE"
   printf "\n"
 
-  # Verify the hash captured inline during download — no second read needed.
-  if [[ -n "$ACTUAL_HASH" && -n "$EXPECTED_HASH" && "$EXPECTED_HASH" != "null" \
-        && "$ACTUAL_HASH" != "$EXPECTED_HASH" ]]; then
+  # The hash captured during the download: did it arrive intact?
+  if [[ -n "$HASH_CMD" && "$ACTUAL_HASH" != "$EXPECTED_HASH" ]]; then
     printf "   Expected: %s\n" "$EXPECTED_HASH"
     printf "   Got:      %s\n" "$ACTUAL_HASH"
-    download_failed "$LABEL" "$VERSION" "Checksum mismatch ($HASH_ALGO) — file removed, will retry next run"
+    download_failed "$LABEL" "$VERSION" "Checksum mismatch ($HASH_ALGO) in the download — file removed, will retry next run"
     return
   fi
 
-  # The hash only covers what curl received. Flush the file to the NAS and
-  # check all of it arrived, so a write the NAS lost isn't cached as verified.
+  # That hash only covers what curl received. Flush the file to the NAS and
+  # check all of it arrived ...
   if ! sync "$PARTIAL_PATH"; then
     download_failed "$LABEL" "$VERSION" "Couldn't write the file to the download folder"
     return
@@ -630,21 +664,121 @@ download_unique() {
     return
   fi
 
+  # ... then read it back and check its contents, before it gets its final
+  # name: a file that fails never appears as an IPSW.
+  printf "🔍 [%s]: Checking the saved copy of %s...\n" "$LABEL" "$FILE_NAME"
+  check_on_disk "$PARTIAL_PATH" "$FILE_NAME" "$EXPECTED_HASH" "$HASH_ALGO"
+  case "$V_STATUS" in
+    ok) ;;
+    reread-ok) warn_reread "$LABEL" "$FILE_NAME" ;;
+    mismatch)
+      if [[ -n "$HASH_CMD" ]]; then
+        download_failed "$LABEL" "$VERSION" "The download arrived intact but the copy saved to the download folder is damaged ($HASH_ALGO read back as $V_HASH) — check the network connection to the NAS and its disks. File removed, will retry next run"
+      else
+        download_failed "$LABEL" "$VERSION" "The saved file is damaged: $V_INFO — file removed, will retry next run"
+      fi
+      return
+      ;;
+    *)
+      download_failed "$LABEL" "$VERSION" "Couldn't read the saved file back to check it: $V_INFO — file removed, will retry next run"
+      return
+      ;;
+  esac
+
   mv "$PARTIAL_PATH" "$FILE_PATH"
   CURRENT_PARTIAL=""
-  # Cache the hash and size so future runs skip re-reading from the NAS
-  printf "%s %s %s\n" "$HASH_ALGO" "${ACTUAL_HASH:--}" "$ON_DISK" > "$CACHE_FILE"
-  printf "✅ [%s]: iOS %s downloaded and verified\n" "$LABEL" "$VERSION"
-  printf "%s  ✅ [%s]: iOS %s downloaded and verified\n" "$(timestamp)" "$LABEL" "$VERSION" >> "$LOG_FILE"
+  write_cache "$CACHE_FILE" "$HASH_ALGO" "$EXPECTED_HASH" "$ON_DISK"
+  track_checked "$(date +%s)"
+  note "✅ [$LABEL]: iOS $VERSION downloaded and verified in the download folder ($(checked_how "$HASH_ALGO"))"
+}
+
+# A file that's already in the download folder: read it back and check it.
+# Only one that's actually damaged is downloaded again; one that can't be
+# read (the NAS is offline, say) is left alone and reported.
+verify_existing() {
+  local VERSION="$2" EXPECTED_HASH="$3" HASH_ALGO="$4" LABEL="$6"
+  local FILE_NAME FILE_PATH CACHE_FILE
+  FILE_NAME=$(basename "$1")
+  FILE_PATH="$DOWNLOAD_DIR/$FILE_NAME"
+  CACHE_FILE="$HASH_CACHE_DIR/${FILE_NAME}.hash"
+
+  printf "🔍 [%s]: Checking %s in the download folder...\n" "$LABEL" "$FILE_NAME"
+  check_on_disk "$FILE_PATH" "$FILE_NAME" "$EXPECTED_HASH" "$HASH_ALGO"
+  case "$V_STATUS" in
+    ok|reread-ok)
+      [[ "$V_STATUS" == "reread-ok" ]] && warn_reread "$LABEL" "$FILE_NAME"
+      write_cache "$CACHE_FILE" "$HASH_ALGO" "$EXPECTED_HASH" "$(file_size "$FILE_PATH")"
+      track_checked "$(date +%s)"
+      note "✅ [$LABEL]: iOS $VERSION verified in the download folder ($(checked_how "$HASH_ALGO"))"
+      ;;
+    mismatch)
+      if [[ "$HASH_ALGO" == "zip" ]]; then
+        note "❌ [$LABEL]: $FILE_NAME is damaged: $V_INFO — downloading it again"
+      else
+        note "❌ [$LABEL]: $FILE_NAME is damaged ($HASH_ALGO is $V_HASH, should be $EXPECTED_HASH) — downloading it again"
+      fi
+      rm -f "$FILE_PATH" "$CACHE_FILE"
+      download_unique "$@"
+      ;;
+    *)
+      (( CHECK_FAILURES++ )) || true
+      note "❌ [$LABEL]: Couldn't check $FILE_NAME: $V_INFO — left as it is, will retry next run"
+      ;;
+  esac
+}
+
+# Decides what a wanted file needs: nothing, a check or a download. Checks
+# of files already there are queued in RECHECK and done after the downloads,
+# so new firmware isn't kept waiting behind them.
+RECHECK=()
+
+process_unique() {
+  local URL="$1" VERSION="$2" EXPECTED_HASH="$3" HASH_ALGO="$4" LABEL="$6"
+  local FILE_NAME FILE_PATH CACHE_FILE
+  FILE_NAME=$(basename "$URL")
+  FILE_PATH="$DOWNLOAD_DIR/$FILE_NAME"
+  CACHE_FILE="$HASH_CACHE_DIR/${FILE_NAME}.hash"
+
+  echo "$FILE_NAME" >> "$TMP_FILE"
+
+  if [[ ! -f "$FILE_PATH" ]]; then
+    download_unique "$@"
+    return
+  fi
+
+  local C_VER="" C_ALGO="" C_HASH="" C_SIZE="" C_WHEN="" ON_DISK
+  if [[ -f "$CACHE_FILE" ]]; then
+    read -r C_VER C_ALGO C_HASH C_SIZE C_WHEN < "$CACHE_FILE" || true
+  fi
+  if [[ "$C_VER" == "v2" && "$C_ALGO" == "$HASH_ALGO" && "$C_HASH" == "$EXPECTED_HASH" \
+        && "$C_WHEN" =~ ^[0-9]+$ ]]; then
+    # A size check is cheap and catches a file that was cut short on the NAS.
+    ON_DISK=$(file_size "$FILE_PATH")
+    if [[ "$ON_DISK" != "$C_SIZE" ]]; then
+      note "⚠️  [$LABEL]: $FILE_NAME is $ON_DISK bytes but was $C_SIZE when it was checked — downloading it again"
+      rm -f "$FILE_PATH" "$CACHE_FILE"
+      download_unique "$@"
+      return
+    fi
+    if (( ! FORCE_REVERIFY )) \
+       && (( REVERIFY_DAYS == 0 || $(date +%s) - C_WHEN < REVERIFY_DAYS * 86400 )); then
+      track_checked "$C_WHEN"
+      note "✅ [$LABEL]: Already verified, checked $(days_ago "$C_WHEN") (iOS $VERSION)"
+      return
+    fi
+  fi
+  # Never read back (it predates that check, or the cache was cleared), the
+  # checksum on ipsw.me has changed, or the last check is old.
+  RECHECK+=("$URL")
 }
 
 # We hold the lock, so any .partial is left over from a run that was killed.
 rm -f "$DOWNLOAD_DIR"/*.ipsw.partial
 
-log "🚀 Downloading $UNIQUE_COUNT firmware files sequentially..."
+log "🚀 Checking $UNIQUE_COUNT firmware files, downloading what's missing..."
 
 for URL in "${!URL_DEVICES[@]}"; do
-  download_unique \
+  process_unique \
     "$URL" \
     "${URL_VERSION[$URL]}" \
     "${URL_SHA[$URL]}" \
@@ -653,13 +787,31 @@ for URL in "${!URL_DEVICES[@]}"; do
     "${URL_DEVICES[$URL]}"
 done
 
+if (( ${#RECHECK[@]} > 0 )); then
+  log "🔍 Reading ${#RECHECK[@]} stored file(s) back to check them..."
+  for URL in "${RECHECK[@]}"; do
+    verify_existing \
+      "$URL" \
+      "${URL_VERSION[$URL]}" \
+      "${URL_SHA[$URL]}" \
+      "${URL_SHA_ALGO[$URL]}" \
+      "${URL_SIZE[$URL]}" \
+      "${URL_DEVICES[$URL]}"
+  done
+fi
+
 FAILED=("$META_DIR"/*.failed)
 if [[ -e "${FAILED[0]}" ]]; then
   finish 1 "⚠️  Firmware lookup failed for ${#FAILED[@]} phone(s) — skipping cleanup so their IPSWs aren't deleted."
 fi
 
-if (( DOWNLOAD_FAILURES > 0 )); then
-  finish 1 "⚠️  ${DOWNLOAD_FAILURES} download(s) failed — skipping cleanup so those phones keep their current IPSWs."
+if (( DOWNLOAD_FAILURES > 0 || CHECK_FAILURES > 0 )); then
+  PROBLEMS=()
+  (( DOWNLOAD_FAILURES > 0 )) && PROBLEMS+=("${DOWNLOAD_FAILURES} download(s) failed")
+  (( CHECK_FAILURES > 0 )) && PROBLEMS+=("${CHECK_FAILURES} stored file(s) couldn't be checked")
+  SUMMARY="${PROBLEMS[0]}"
+  (( ${#PROBLEMS[@]} > 1 )) && SUMMARY+=" and ${PROBLEMS[1]}"
+  finish 1 "⚠️  ${SUMMARY} — skipping cleanup so those phones keep their current IPSWs."
 fi
 
 log "🧹 Cleaning up old IPSWs..."
@@ -679,5 +831,12 @@ done
 
 # What ipsw.me listed is now what's in the folder.
 mv -f "$ATTEMPTED_FILE" "$SYNCED_FILE" 2>/dev/null || true
+
+# When the oldest check reaches REVERIFY_DAYS, `--if-new` starts a run.
+if (( REVERIFY_DAYS > 0 && OLDEST_CHECK > 0 )); then
+  echo $(( OLDEST_CHECK + REVERIFY_DAYS * 86400 )) > "$REVERIFY_DUE_FILE" 2>/dev/null || true
+else
+  rm -f "$REVERIFY_DUE_FILE"
+fi
 
 finish 0 "✅ Done — ${#KEEP_FILES[@]} file(s) retained, $REMOVED removed."

@@ -1,4 +1,5 @@
 *
 !ipsw-manager.sh
+!ipsw-verify.py
 !webui.py
 !entrypoint.sh
