@@ -1327,6 +1327,10 @@ function rel(iso) {
   return s > 0 ? "in " + t : t + " ago";
 }
 
+// For things that already happened: a server clock a little ahead of the
+// browser's mustn't make them look like they're still to come.
+const ago = iso => new Date(iso) > Date.now() ? "just now" : rel(iso);
+
 // Only touch the DOM when something changed, so tooltips and selections survive polls.
 function setHTML(el, html) {
   if (el._html !== html) { el.innerHTML = html; el._html = html; }
@@ -1377,7 +1381,7 @@ function setRunButtons(disabled) {
 }
 
 async function refresh() {
-  if (polling) return;  // a slow NAS can make a poll outlast the interval
+  if (polling) return;  // a slow download folder can make a poll outlast the interval
   polling = true;
   try {
     let d;
@@ -1445,7 +1449,7 @@ function renderBanners(d) {
     const when = m ? m[1] : null, text = m ? m[2] : d.last_run;
     lr.className = "banner sev-" + (severity(text) || "info");
     setHTML(lr, '<span class="banner-label">Last run'
-      + (when ? ' <span title="' + esc(fmt(when)) + '">' + esc(rel(when)) + '</span>' : "")
+      + (when ? ' <span title="' + esc(fmt(when)) + '">' + esc(ago(when)) + '</span>' : "")
       + '</span><span>' + esc(text) + '</span>');
     lr.hidden = false;
   }
@@ -1474,11 +1478,11 @@ function statusCell(f) {
   if (f.check_failed) {
     return '<span class="badge badge-orange" title="' + esc("Couldn't be read back to check it on " + fmt(f.check_failed.at) + ": "
         + f.check_failed.reason + (f.verified ? ". Last verified " + fmt(f.checked) : ". Never verified") + ". The next run tries again.")
-      + '">⚠ Check failed</span><span class="sub">' + esc(rel(f.check_failed.at) + ": " + f.check_failed.reason) + '</span>';
+      + '">⚠ Check failed</span><span class="sub">' + esc(ago(f.check_failed.at) + ": " + f.check_failed.reason) + '</span>';
   }
   if (f.verified) {
     return '<span class="badge badge-green" title="The copy in the download folder was read back and matched its checksum on '
-      + esc(fmt(f.checked)) + '">✓ Verified</span><span class="sub">' + esc(rel(f.checked) + nextCheck(f)) + '</span>';
+      + esc(fmt(f.checked)) + '">✓ Verified</span><span class="sub">' + esc(ago(f.checked) + nextCheck(f)) + '</span>';
   }
   return '<span class="badge badge-orange" title="Not yet read back from the download folder and checked. The next run, or Re-verify, will do it.">? Not checked</span>'
     + '<span class="sub">next run</span>';
