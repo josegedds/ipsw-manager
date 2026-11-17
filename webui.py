@@ -1264,7 +1264,7 @@ details.card:not([open])>summary{border-bottom:none}
       <button id="btn-default" class="btn-gray" onclick="resetDefault()" title="Tick iPhone 11 and newer: what's downloaded until a selection is saved">Reset to default</button>
       <button id="btn-save" class="btn-green" onclick="saveDevices()" disabled>Save</button>
     </div>
-    <div class="dev-note" id="dev-note">Unticked phones' firmware is deleted on the next run. Phones Apple no longer signs firmware for are skipped.</div>
+    <div class="dev-note" id="dev-note">Unticked phones' firmware is deleted on the next run.</div>
     <div class="dev-grid" id="dev-grid"><div class="empty">Loading…</div></div>
   </section>
   <section class="card" aria-labelledby="hist-title">
