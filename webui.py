@@ -53,7 +53,7 @@ DOWNLOAD_LINKS = os.environ.get("WEBUI_DOWNLOADS", "1").strip().lower() not in (
 _run_lock = threading.Lock()
 _io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="ipsw-io")
 IO_TIMEOUT = 5  # seconds before giving up on a NAS read
-_io_pending = {}  # function name -> Future still stuck on the NAS
+_io_pending = {}  # function name -> (Future, monotonic time it started) of the oldest unfinished call
 _io_pending_lock = threading.Lock()
 SPEED_WINDOW = 15  # seconds of .partial size samples used to work out download speed
 # Written by ipsw-manager.sh while it downloads: file name, then expected bytes.
@@ -82,16 +82,21 @@ def _with_timeout(fn, *args, fallback):
     """Run fn(*args) in a thread pool; return fallback if it doesn't finish in IO_TIMEOUT seconds.
 
     A call stuck on a hung mount keeps its worker thread until the mount
-    answers. While one is stuck, later calls to the same function return
-    fallback straight away instead of tying up another worker.
+    answers. Once an unfinished call has run for IO_TIMEOUT seconds, later
+    calls to the same function return fallback straight away instead of
+    tying up another worker. A call that's merely still going (another tab's
+    poll, say) doesn't count: this one runs alongside it.
     """
     name = fn.__name__
+    now = time.monotonic()
     with _io_pending_lock:
-        stuck = _io_pending.get(name)
-        if stuck is not None and not stuck.done():
+        pending = _io_pending.get(name)
+        busy = pending is not None and not pending[0].done()
+        if busy and now - pending[1] >= IO_TIMEOUT:
             return fallback
         future = _io_executor.submit(fn, *args)
-        _io_pending[name] = future
+        if not busy:
+            _io_pending[name] = (future, now)
     try:
         return future.result(timeout=IO_TIMEOUT)
     except concurrent.futures.TimeoutError:
@@ -1023,7 +1028,7 @@ h1{font-size:16px;font-weight:600;letter-spacing:-.3px;white-space:nowrap}
 #status-lbl{font-size:12px;color:var(--muted)}
 .hdr-meta{font-size:11px;color:var(--faint)}
 .spacer{flex:1}
-.hdr-actions{display:flex;gap:8px}
+.hdr-actions{display:flex;flex-wrap:wrap;gap:8px}
 button{padding:7px 15px;border-radius:6px;border:1px solid transparent;cursor:pointer;font-size:13px;font-weight:500;font-family:inherit;white-space:nowrap;transition:opacity .15s,background .15s}
 .btn-green{background:var(--btn-green);color:#fff;border-color:var(--btn-green)}
 .btn-green:hover:not(:disabled){background:var(--btn-green-hover)}
@@ -1166,6 +1171,8 @@ details.card:not([open])>summary{border-bottom:none}
   .settings dl{grid-template-columns:1fr;gap:0}
   .settings dd{margin-bottom:8px}
   header{padding:10px 16px}
+  header.running #btn-verify{display:none}  /* disabled during a run anyway; makes room for Stop */
+  .spacer{display:none}  /* buttons that wrap to their own row stay on the left */
   main{padding:16px;gap:16px}
   .hide-sm{display:none}
   th,td{padding:9px 7px}
@@ -1404,6 +1411,7 @@ async function refresh() {
     lastStatus = d;
     $("poll-ts").textContent = "updated " + new Date().toLocaleTimeString();
     $("dot").className = d.running ? "running" : "";
+    document.querySelector("header").classList.toggle("running", d.running);
     stopping = stopping && d.running;
     $("status-lbl").textContent = !d.running ? "Idle" : stopping ? "Stopping…" : d.reverifying ? "Re-verifying…" : "Running…";
     if (!runPending) setRunButtons(d.running);
