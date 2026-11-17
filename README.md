@@ -17,12 +17,16 @@ Docker image: [`josephgeddes/ipsw-manager`](https://hub.docker.com/r/josephgedde
 
 Open `http://<host>:8080` to:
 
-- see downloaded firmware and the run log
+- see downloaded firmware, how much space it takes and how much is free, and the run log
+- see how the last run went and when, and when the next check for new firmware is
+- see phones you've selected that have no IPSW yet, and stored firmware with a newer iOS out. Both come from ipsw.me and are looked up again hourly; the next run catches up on either
 - start a run (**Run Now**), or a run that also reads every stored file back and checks it, however recently it was checked (**Re-verify**)
 - choose which phones to download under **Phones to Download**
 - see the **Release Calendar**: public iOS releases (from ipsw.me), betas and release candidates (from Apple's developer releases feed), and which versions your phones can install now. Apple doesn't announce release dates, so once a release candidate is out the calendar shows the public release as expected about a week later. That date is an estimate.
 
-The selection is saved to `selected-devices.json` in the download folder. Until you save one, iPhone 11 and newer are downloaded.
+The selection is saved to `selected-devices.json` in the download folder. Until you save one, iPhone 11 and newer are downloaded. If saving would leave stored firmware without a ticked phone, the web UI lists those files and asks first, since the next run deletes them.
+
+Click a phone in the firmware table for its file name, when it was last verified, and why a check failed. The page follows your system's light or dark setting and works on a phone. It shows log times in your browser's time zone.
 
 ## Verification
 
@@ -92,7 +96,7 @@ Or with Docker Compose: edit the volume path and settings in [`compose.yml`](com
 
 **When runs happen.** Apple doesn't notify anyone of a release, so "run when a new iOS version is out" means asking often. A check is one small request to ipsw.me per selected phone and doesn't touch the NAS beyond reading the phone selection. A new version is picked up within `CHECK_INTERVAL` minutes of ipsw.me listing it. The first check after the container starts always does a run. A run also starts when stored files are due to be read back and checked again (`IPSW_REVERIFY_DAYS`), and when the last run didn't finish cleanly (see below). A check never notices files deleted from the download folder by hand; use **Run Now** for that, or set `CRON_SCHEDULE` for a regular full run as well. To go back to runs at fixed times only, set `CHECK_INTERVAL=0` and `CRON_SCHEDULE`.
 
-Both are run by [supercronic](https://github.com/aptible/supercronic). The log's timestamps are always in UTC.
+Both are run by [supercronic](https://github.com/aptible/supercronic). The log file's timestamps are always in UTC; the web UI shows them in your browser's time zone.
 
 **Running as a user.** With `PUID` set, the download folder must be writable by that user; the container warns at startup if it isn't. If you previously ran as root, fix the existing files once on the host:
 
@@ -102,7 +106,7 @@ sudo chown -R 1000:1000 /path/to/ipsw
 
 **Restarts and health.** If the web UI or the scheduler stops, the container exits so `--restart unless-stopped` brings it back. A health check polls the web UI every minute, and `docker ps` shows the result.
 
-**Access.** The web UI has no login, and anyone who can reach it can start runs and change the phone list. To make it reachable only from the host itself, publish the port on localhost: `-p 127.0.0.1:8080:8080`.
+**Access.** The web UI has no login, and anyone who can reach it can start runs and change the phone list. It refuses those requests when another website sends them through a visitor's browser. To make it reachable only from the host itself, publish the port on localhost: `-p 127.0.0.1:8080:8080`.
 
 **If ipsw.me is unreachable.** Lookups are retried. If any phone's lookup still fails, that run downloads what it can but skips the cleanup, so that phone's IPSW isn't deleted. Files that are due a check (or all of them, with **Re-verify**) are checked against their saved checksums. The checks start a run again once ipsw.me answers for every phone.
 
