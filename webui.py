@@ -820,7 +820,7 @@ def _apple_prereleases(since):
 
 
 # Each phone's signed firmware, shared by the calendar (which versions can be
-# installed now) and the firmware table (missing phones, newer iOS out).
+# installed now) and the firmware table (missing phones, newer iOS available).
 _firmware = {}         # identifier -> (time fetched, {"signed": set, "latest": str or None})
 _firmware_failed = {}  # identifier -> time of the last failed lookup
 _firmware_lock = threading.Lock()
@@ -1502,7 +1502,7 @@ function fileRow(f) {
     + '<td><button type="button" class="row-toggle" data-name="' + esc(f.name) + '" aria-expanded="' + open + '">'
     + '<span class="chev" aria-hidden="true">›</span>' + esc(f.model || f.identifiers.join(", ") || f.name) + '</button></td>'
     + '<td class="ios">' + ios + (f.update ? '<span class="sub warn" title="Apple now signs iOS ' + esc(f.update)
-      + ' for this phone. The next run downloads it, then deletes this file.">' + esc(f.update) + ' is out</span>' : "") + '</td>'
+      + ' for this phone. The next run downloads it, then deletes this file.">' + esc(f.update) + ' Available</span>' : "") + '</td>'
     + '<td>' + statusCell(f) + '</td></tr>';
 }
 
@@ -1721,7 +1721,7 @@ function renderSummary(d) {
     if (c.notChecked) chips.push(["warn", c.notChecked + " not checked"]);
     if (c.failed) chips.push(["warn", c.failed + (c.failed === 1 ? " check" : " checks") + " failed"]);
     if (missing) chips.push(["muted", missing + " not downloaded"]);
-    if (updates) chips.push(["warn", updates + " with a newer iOS out"]);
+    if (updates) chips.push(["warn", updates + " with a newer iOS available"]);
   }
   el.hidden = !chips.length;
   setHTML(el, chips.map(([k, t]) => '<span class="chip chip-' + k + '">' + esc(t) + '</span>').join(""));

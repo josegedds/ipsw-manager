@@ -21,7 +21,7 @@ Open `http://<host>:8080` to:
 - see when each file was last verified and when a run will next read it back (`IPSW_REVERIFY_DAYS`)
 - download any stored IPSW (see [Download links](#download-links))
 - see how the last run went and when, and when the next check for new firmware is
-- see phones you've selected that have no IPSW yet, and stored firmware with a newer iOS out. Both come from ipsw.me and are looked up again hourly; the next run catches up on either
+- see phones you've selected that have no IPSW yet, and stored firmware with a newer iOS available. Both come from ipsw.me and are looked up again hourly; the next run catches up on either
 - start a run (**Run Now**), or a run that also reads every stored file back and checks it, however recently it was checked (**Re-verify**)
 - stop a run in progress (**Stop**). A download in progress is thrown away and started again by a later run; files already downloaded and checked are kept, and if the run hadn't reached its cleanup no old IPSWs are deleted. The scheduled checks try again after `IPSW_RETRY_MINUTES`
 - choose which phones to download under **Phones to Download**. Phones with an IPSW in the folder are tagged **stored**, and phones Apple signs no firmware for **not signed**. **Reset to default** ticks iPhone 11 and newer
