@@ -34,12 +34,14 @@ import io
 import json
 import mmap
 import os
+import queue
 import sys
 import threading
 import time
 import zipfile
 
 CHUNK = 8 * 1024 * 1024
+BUFFERS = 3  # chunks in memory at once while a file is hashed
 SPEED_WINDOW = 10  # seconds of progress used to work out the read speed
 
 EXIT_OK, EXIT_MISMATCH, EXIT_UNREADABLE = 0, 1, 2
@@ -145,18 +147,24 @@ def open_for_check(path, direct):
     return os.open(path, flags), False
 
 
-def hash_file(path, algo, progress):
-    """Hash of the whole file as stored. Returns (hex digest, bytes read)."""
-    digest = hashlib.new(algo)
-    buf = mmap.mmap(-1, CHUNK)  # page-aligned, which O_DIRECT needs
-    view = memoryview(buf)
-    fd, direct = open_for_check(path, direct=True)
-    offset = 0
+def read_chunks(path, free, full):
+    """Reader thread: fills buffers from `free` with the file and passes them to `full`.
+
+    Each item put on `full` is (buffer, bytes read), with 0 bytes at the end of
+    the file, or the exception that stopped the read. A None from `free` means
+    stop early.
+    """
+    fd = None
     try:
+        fd, direct = open_for_check(path, direct=True)
         flush(fd)
         if not direct:
             drop_cache(fd)
+        offset = 0
         while True:
+            buf = free.get()
+            if buf is None:
+                return
             try:
                 n = os.readv(fd, [buf])
             except OSError as exc:
@@ -164,24 +172,63 @@ def hash_file(path, algo, progress):
                 # read. Carry on from the same place without it.
                 if direct and exc.errno in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP):
                     os.close(fd)
+                    fd = None
                     fd, direct = open_for_check(path, direct=False)
                     flush(fd)
                     drop_cache(fd)
                     os.lseek(fd, offset, os.SEEK_SET)
+                    free.put(buf)
                     continue
                 raise
+            if n and not direct:
+                drop_cache(fd, offset, n)  # keeps a multi-GB file out of memory, too
+            full.put((buf, n))
+            if n == 0:
+                return
+            offset += n
+    except BaseException as exc:  # handed to the hashing thread, which reports it
+        full.put(exc)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def hash_file(path, algo, progress):
+    """Hash of the whole file as stored. Returns (hex digest, bytes read).
+
+    A reader thread fetches the next chunk while this one hashes the last, so
+    the disk or network and the CPU work at the same time instead of taking
+    turns. Both os.readv and hashlib release the GIL for chunks this size.
+    """
+    digest = hashlib.new(algo)
+    # Page-aligned, which O_DIRECT needs: one being hashed, one being read,
+    # and one ready for the reader so it never waits on the hash.
+    buffers = [mmap.mmap(-1, CHUNK) for _ in range(BUFFERS)]
+    free, full = queue.Queue(), queue.Queue()
+    for buf in buffers:
+        free.put(buf)
+    reader = threading.Thread(target=read_chunks, args=(path, free, full), daemon=True)
+    reader.start()
+    total = 0
+    try:
+        while True:
+            item = full.get()
+            if isinstance(item, BaseException):
+                raise item
+            buf, n = item
             if n == 0:
                 break
-            digest.update(view[:n])
-            if not direct:
-                drop_cache(fd, offset, n)  # keeps a multi-GB file out of memory, too
-            offset += n
+            with memoryview(buf) as view, view[:n] as data:
+                digest.update(data)
+            total += n
             progress.add(n)
+            free.put(buf)
     finally:
-        os.close(fd)
-        view.release()
-        buf.close()
-    return digest.hexdigest(), offset
+        free.put(None)  # stops the reader if it's still going
+        reader.join()
+        for buf in buffers:
+            buf.close()
+    return digest.hexdigest(), total
 
 
 class CountingFile(io.FileIO):
