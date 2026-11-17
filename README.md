@@ -24,7 +24,7 @@ Open `http://<host>:8080` to:
 - see phones you've selected that have no IPSW yet, and stored firmware with a newer iOS available. Both come from ipsw.me and are looked up again hourly; the next run catches up on either
 - start a run (**Run Now**), or a run that also reads every stored file back and checks it, however recently it was checked (**Re-verify**)
 - stop a run in progress (**Stop**). A download in progress is thrown away and started again by a later run; files already downloaded and checked are kept, and if the run hadn't reached its cleanup no old IPSWs are deleted. The scheduled checks try again after `IPSW_RETRY_MINUTES`
-- choose which phones to download under **Phones to Download**. Phones with an IPSW in the folder are tagged **stored**, and phones Apple signs no firmware for **not signed**. **Reset to default** ticks iPhone 11 and newer
+- choose which phones to download under **Phones to Download**. Phones are grouped by family, newest first, and a family's own tick box selects all of its models. Regional versions of a phone ("iPhone X (GSM)" and "(Global)", say) are one choice. iPhone 7 and earlier are folded away unless one is ticked. Phones with an IPSW in the folder are tagged **stored**, and phones Apple signs no firmware for **not signed**. **Reset to default** ticks iPhone 11 and newer
 - see the **Run History**: when each of the last 30 runs started, how long it took, what started it, and how it ended
 - filter the log to **Problems** (warnings and errors) or the **Latest run**, or download the whole log file
 - see the settings the container is running with, under **Settings**

@@ -1087,11 +1087,22 @@ tr.missing td:first-child{color:var(--text);font-weight:500;padding-left:30px}
 .dev-tools input{flex:1;min-width:160px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:6px 10px;font-size:13px;font-family:inherit}
 .dev-tools button{font-size:12px;padding:5px 11px}
 .dev-note{padding:10px 18px 0;font-size:12px;color:var(--muted)}
-.dev-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:2px 12px;padding:12px 18px 16px;max-height:420px;overflow-y:auto}
-.dev-grid label{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:5px;font-size:13px;cursor:pointer}
-.dev-grid label:hover{background:var(--hover)}
-.dev-grid input{accent-color:var(--btn-green)}
-.dev-grid .mono{color:var(--muted);font-size:11px;margin-left:auto}
+.dev-selected{padding:8px 18px 0;font-size:12px;color:var(--muted);line-height:1.5}
+.dev-selected b{color:var(--text);font-weight:600}
+.dev-grid{padding:4px 18px 14px;max-height:560px;overflow-y:auto}
+.dev-grid input{accent-color:var(--btn-green);margin:0;flex-shrink:0}
+.fam{display:grid;grid-template-columns:200px 1fr;gap:6px 14px;align-items:start;padding:10px 0;border-bottom:1px solid var(--border-soft)}
+.fam:last-child{border-bottom:none}
+.fam-hdr{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;cursor:pointer;padding-top:5px}
+.fam-count{font-weight:400;color:var(--muted);font-size:11px}
+.fam-models{display:flex;flex-wrap:wrap;gap:6px}
+.phone{display:inline-flex;align-items:center;gap:6px;padding:4px 10px 4px 8px;border:1px solid var(--border);border-radius:16px;font-size:13px;cursor:pointer;user-select:none}
+.phone:hover{background:var(--hover)}
+.phone:has(input:checked),.phone:has(input:indeterminate){border-color:var(--btn-green);background:var(--green-bg)}
+.phone.unsigned{color:var(--muted);border-style:dashed}
+.phone .tag{margin-left:0}
+.older-hdr{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;padding:16px 0 0}
+.older-toggle{margin:12px 0 2px}
 .cal-nav{display:flex;align-items:center;gap:6px}
 .cal-month{font-size:13px;font-weight:600;min-width:130px;text-align:center}
 .cal-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr))}
@@ -1141,7 +1152,6 @@ a.btn-gray{display:inline-block;text-decoration:none;font-weight:500;border:1px 
 .tag{font-size:10px;font-weight:600;padding:1px 6px;border-radius:10px;white-space:nowrap;margin-left:6px;vertical-align:1px}
 .tag-stored{background:var(--green-bg);color:var(--green)}
 .tag-unsigned{background:var(--gray-bg);color:var(--muted)}
-.dev-grid label.unsigned>span:first-of-type{color:var(--muted)}
 details.card>summary{list-style:none;cursor:pointer}
 details.card>summary::-webkit-details-marker{display:none}
 details.card>summary .chev{display:inline-block;color:var(--faint);transition:transform .15s;margin-right:8px}
@@ -1152,7 +1162,9 @@ details.card:not([open])>summary{border-bottom:none}
 .settings dd{min-width:0;overflow-wrap:anywhere}
 .settings .note{padding:0 18px 14px;font-size:12px;color:var(--muted)}
 @media (max-width:640px){
-  .summary,.settings dl,.settings .note{padding-left:14px;padding-right:14px}
+  .summary,.settings dl,.settings .note,.dev-grid,.dev-selected{padding-left:14px;padding-right:14px}
+  .fam{grid-template-columns:1fr}
+  .dev-grid{max-height:none}  /* one scroll, the page's, on a touch screen */
   .settings dl{grid-template-columns:1fr;gap:0}
   .settings dd{margin-bottom:8px}
   header{padding:10px 16px}
@@ -1251,10 +1263,11 @@ details.card:not([open])>summary{border-bottom:none}
       <input id="dev-filter" type="search" placeholder="Filter, e.g. 15 Pro or iPhone8" aria-label="Filter phones" oninput="renderDevices()">
       <button id="btn-all" class="btn-gray" onclick="setVisible(true)">Select all</button>
       <button id="btn-none" class="btn-gray" onclick="setVisible(false)">Select none</button>
-      <button class="btn-gray" onclick="resetDefault()" title="Tick iPhone 11 and newer: what's downloaded until a selection is saved">Reset to default</button>
+      <button id="btn-default" class="btn-gray" onclick="resetDefault()" title="Tick iPhone 11 and newer: what's downloaded until a selection is saved">Reset to default</button>
       <button id="btn-save" class="btn-green" onclick="saveDevices()" disabled>Save</button>
     </div>
     <div class="dev-note" id="dev-note">Unticked phones' firmware is deleted on the next run. Phones Apple no longer signs firmware for are skipped.</div>
+    <div class="dev-selected" id="dev-selected" aria-live="polite"></div>
     <div class="dev-grid" id="dev-grid"><div class="empty">Loading…</div></div>
   </section>
   <section class="card" aria-labelledby="hist-title">
@@ -1885,6 +1898,8 @@ async function loadConfig() {
 /* ---------- Phones ---------- */
 
 let allDevices = [];
+let models = [];   // one entry per phone, its regional versions merged, in display order
+let olderOpen = false;
 let defaultIds = [];
 let tagsKey = "";
 let selected = new Set();
@@ -1894,7 +1909,19 @@ let baselineSelection = null;  // what the page loaded with or last saved, for t
 const selectionKey = () => [...selected].sort().join(",");
 
 function updateDeviceMeta() {
-  $("dev-count").textContent = selected.size + " of " + allDevices.length + " selected";
+  const chosen = models.filter(m => modelState(m) !== "none");
+  $("dev-count").textContent = chosen.length + " of " + models.length + " selected";
+  // A whole family reads as "iPhone 16 (all)", so a long selection stays short.
+  const parts = groupModels(models).flatMap(g => {
+    const picked = g.models.filter(m => modelState(m) !== "none");
+    if (g.models.length > 1 && picked.length === g.models.length && picked.every(m => modelState(m) === "all")) {
+      return [g.name + " (all)"];
+    }
+    return picked.map(m => m.name + (modelState(m) === "some" ? " (some versions)" : ""));
+  });
+  $("dev-selected").innerHTML = parts.length
+    ? "<b>Selected:</b> " + parts.map(esc).join(", ")
+    : "<b>Nothing selected.</b> Tick at least one phone to save.";
   const dirty = selectionKey() !== savedSelection;
   $("btn-save").disabled = !dirty || selected.size === 0;
   $("btn-save").textContent = dirty ? "Save" : "Saved";
@@ -1902,31 +1929,137 @@ function updateDeviceMeta() {
 
 const filterText = () => $("dev-filter").value.trim().toLowerCase();
 
-function visibleDevices() {
-  const q = filterText();
-  return q ? allDevices.filter(d => (d.name + " " + d.identifier).toLowerCase().includes(q)) : allDevices;
+// Regional versions of one phone, e.g. "iPhone X (GSM)" and "iPhone X (Global)",
+// are one choice: ticking it ticks every identifier.
+const REGION_RE = /\s*\((?:GSM|Global|CDMA|China|US|GSM \/ \d{4})\)$/i;
+const OLDER_BEFORE = 10;  // families whose newest identifier is below iPhone10,x (iPhone 7 and earlier) fold away
+
+const idKey = id => id.slice(6).split(",").map(Number);  // "iPhone17,1" -> [17, 1]
+const newestFirst = (a, b) => b[0] - a[0] || b[1] - a[1];
+
+function familyOf(name) {
+  if (/^iPhone SE\b/.test(name)) return "iPhone SE";
+  if (/^iPhone X(S|R)?\b/.test(name)) return "iPhone X, XS & XR";
+  if (/^iPhone (2G|3GS?)$/.test(name)) return "iPhone 2G, 3G & 3GS";
+  const m = name.match(/^iPhone (\d+[sc]?)/);
+  return m ? "iPhone " + m[1] : name;
 }
+
+// Within a family: base model, mini, Plus, Pro, Pro Max, then the "e".
+function modelRank(name) {
+  if (/ Pro Max$/.test(name)) return 4;
+  if (/ Pro$/.test(name)) return 3;
+  if (/( Plus|\+)$/.test(name)) return 2;
+  if (/ mini$/.test(name)) return 1;
+  if (/\de$/.test(name)) return 5;
+  return 0;
+}
+
+function groupModels(list) {
+  const families = new Map();
+  list.forEach(m => {
+    if (!families.has(m.family)) families.set(m.family, []);
+    families.get(m.family).push(m);
+  });
+  return [...families].map(([name, ms]) => {
+    ms.sort((a, b) => modelRank(a.name) - modelRank(b.name) || newestFirst(a.newest, b.newest));
+    const newest = ms.map(m => m.newest).sort(newestFirst)[0];
+    return {name, models: ms, newest, older: newest[0] < OLDER_BEFORE};
+  }).sort((a, b) => newestFirst(a.newest, b.newest));
+}
+
+function buildModels(devices) {
+  const byName = new Map();
+  devices.forEach(d => {
+    const name = d.name.replace(REGION_RE, "");
+    if (!byName.has(name)) byName.set(name, {name, ids: [], family: familyOf(name)});
+    byName.get(name).ids.push(d.identifier);
+  });
+  const list = [...byName.values()];
+  list.forEach(m => {
+    m.ids.sort((a, b) => newestFirst(idKey(a), idKey(b)));
+    m.newest = idKey(m.ids[0]);
+  });
+  return groupModels(list).flatMap(g => g.models);
+}
+
+function modelState(m) {
+  const n = m.ids.filter(i => selected.has(i)).length;
+  return n === 0 ? "none" : n === m.ids.length ? "all" : "some";
+}
+
+const modelMatches = (m, q) => !q || (m.name + " " + m.family + " " + m.ids.join(" ")).toLowerCase().includes(q);
 
 // Phones with a finished IPSW in the download folder.
 const storedIds = () => new Set(((lastStatus && lastStatus.downloads) || []).filter(f => !f.partial).flatMap(f => f.identifiers));
 const computeTagsKey = () => [...storedIds()].sort().join(",") + "|"
   + allDevices.filter(d => d.signed === false).map(d => d.identifier).join(",");
 
+function phoneHTML(m, signedById, stored) {
+  const unsigned = m.ids.every(i => signedById.get(i) === false);
+  const title = m.name + " · " + m.ids.join(", ")
+    + (unsigned ? " · Apple signs no firmware for it now, so nothing is downloaded" : "");
+  return '<label class="phone' + (unsigned ? " unsigned" : "") + '" title="' + esc(title) + '">'
+    + '<input type="checkbox" data-ids="' + esc(m.ids.join(" ")) + '">'
+    + '<span>' + esc(m.name.replace(/^iPhone /, "")) + '</span>'
+    + (m.ids.some(i => stored.has(i)) ? '<span class="tag tag-stored" title="Has an IPSW in the download folder">stored</span>' : "")
+    + (unsigned ? '<span class="tag tag-unsigned">not signed</span>' : "")
+    + '</label>';
+}
+
+function familyHTML(g, signedById, stored) {
+  const ids = g.models.flatMap(m => m.ids);
+  return '<div class="fam" role="group" aria-label="' + esc(g.name) + '">'
+    + '<label class="fam-hdr" title="Tick or untick every ' + esc(g.name) + ' model">'
+    + '<input type="checkbox" data-ids="' + esc(ids.join(" ")) + '">'
+    + '<span>' + esc(g.name) + '</span><span class="fam-count"></span></label>'
+    + '<div class="fam-models">' + g.models.map(m => phoneHTML(m, signedById, stored)).join("") + '</div></div>';
+}
+
 function renderDevices() {
-  const list = visibleDevices();
-  const filtered = filterText() !== "";
+  const q = filterText();
   const stored = storedIds();
-  $("btn-all").textContent = filtered ? "Select shown" : "Select all";
-  $("btn-none").textContent = filtered ? "Clear shown" : "Select none";
-  $("dev-grid").innerHTML = list.length ? list.map(d =>
-    '<label' + (d.signed === false ? ' class="unsigned" title="Apple signs no firmware for this phone now, so nothing is downloaded for it"' : "") + '>'
-    + '<input type="checkbox" data-id="' + esc(d.identifier) + '"' + (selected.has(d.identifier) ? " checked" : "") + '>'
-    + '<span>' + esc(d.name)
-    + (stored.has(d.identifier) ? '<span class="tag tag-stored" title="Has an IPSW in the download folder">stored</span>' : "")
-    + (d.signed === false ? '<span class="tag tag-unsigned">not signed</span>' : "")
-    + '</span><span class="mono">' + esc(d.identifier) + '</span></label>'
-  ).join("") : '<div class="empty">No phones match</div>';
+  const signedById = new Map(allDevices.map(d => [d.identifier, d.signed]));
+  const groups = groupModels(models.filter(m => modelMatches(m, q)));
+  $("btn-all").textContent = q ? "Select shown" : "Select all";
+  $("btn-none").textContent = q ? "Clear shown" : "Select none";
+
+  const current = groups.filter(g => !g.older), older = groups.filter(g => g.older);
+  // Old phones stay out of the way unless one is ticked or matches the filter.
+  const forced = !!q || older.some(g => g.models.some(m => modelState(m) !== "none"));
+  const showOlder = forced || olderOpen;
+  const olderCount = older.reduce((n, g) => n + g.models.length, 0);
+  let html = current.map(g => familyHTML(g, signedById, stored)).join("");
+  if (older.length) {
+    if (showOlder) html += '<div class="older-hdr">Older phones</div><div class="older">' + older.map(g => familyHTML(g, signedById, stored)).join("") + '</div>';
+    if (!forced) {
+      html += '<button type="button" class="btn-gray btn-sm older-toggle" onclick="toggleOlder()">'
+        + (showOlder ? "Hide older phones" : "Show " + olderCount + " older phones (iPhone 7 and earlier)") + '</button>';
+    }
+  }
+  $("dev-grid").innerHTML = html || '<div class="empty">No phones match</div>';
   tagsKey = computeTagsKey();
+  updateChecks();
+}
+
+function toggleOlder() {
+  olderOpen = !olderOpen;
+  renderDevices();
+}
+
+// Tick, untick or half-tick every box from the selection, without redrawing.
+function updateChecks() {
+  document.querySelectorAll("#dev-grid input[data-ids]").forEach(box => {
+    const ids = box.dataset.ids.split(" ");
+    const n = ids.filter(i => selected.has(i)).length;
+    box.checked = n === ids.length;
+    box.indeterminate = n > 0 && n < ids.length;
+  });
+  document.querySelectorAll("#dev-grid .fam").forEach(fam => {
+    const boxes = [...fam.querySelectorAll(".phone input")];
+    const n = boxes.filter(b => b.checked || b.indeterminate).length;
+    fam.querySelector(".fam-count").textContent = n ? n + " of " + boxes.length : "";
+  });
   updateDeviceMeta();
 }
 
@@ -1957,14 +2090,17 @@ async function refreshDeviceHints() {
 }
 
 $("dev-grid").addEventListener("change", e => {
-  const id = e.target.dataset.id;
-  if (!id) return;
-  e.target.checked ? selected.add(id) : selected.delete(id);
-  updateDeviceMeta();
+  const ids = e.target.dataset.ids;
+  if (!ids) return;
+  // Once you've worked in the older phones, keep them open even after unticking the last one.
+  if (e.target.closest(".older")) olderOpen = true;
+  ids.split(" ").forEach(i => e.target.checked ? selected.add(i) : selected.delete(i));
+  updateChecks();
 });
 
 function setVisible(on) {
-  visibleDevices().forEach(d => on ? selected.add(d.identifier) : selected.delete(d.identifier));
+  const q = filterText();
+  models.filter(m => modelMatches(m, q)).forEach(m => m.ids.forEach(i => on ? selected.add(i) : selected.delete(i)));
   renderDevices();
 }
 
@@ -1973,6 +2109,7 @@ async function loadDevices() {
     const d = await (await fetch("/api/devices")).json();
     if (d.error) throw new Error(d.error);
     allDevices = d.devices;
+    models = buildModels(allDevices);
     defaultIds = d.default || [];
     selected = new Set(d.selected);
     savedSelection = d.saved ? selectionKey() : "";
