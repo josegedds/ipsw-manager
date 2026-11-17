@@ -510,6 +510,14 @@ warn_reread() {
   note "⚠️  [$1]: The first read of $2 came back wrong and the second was right — reads from the download folder are unreliable. Check the network connection to the NAS."
 }
 
+# The redrawn progress bar is only for someone watching a terminal
+# (`docker exec -it`). Scheduled runs and Run Now write to `docker logs`,
+# where it would be noise, and redrawing it starts a couple of dozen
+# processes a second for the whole download. The web UI shows progress
+# from the .partial file instead.
+SHOW_BAR=0
+[[ -t 1 ]] && SHOW_BAR=1
+
 draw_progress() {
   local LABEL="$1"
   local VERSION="$2"
@@ -580,17 +588,20 @@ download_unique() {
 
   CURRENT_PARTIAL="$PARTIAL_PATH"
 
-  # Spawn a background poller that redraws the progress line every 0.5s by
-  # reading the .partial file size. Killed as soon as curl exits.
-  (
-    while true; do
-      sleep 0.5
-      draw_progress "$LABEL" "$VERSION" "$(file_size "$PARTIAL_PATH" 2>/dev/null || echo 0)" "$FILESIZE"
-    done
-  ) 9>&- &   # without the run lock, which its last sleep would hold on to briefly
-  POLLER_PID=$!
-
-  draw_progress "$LABEL" "$VERSION" 0 "$FILESIZE"
+  # On a terminal, a background poller redraws the progress line every 0.5s
+  # from the .partial file's size, and is killed as soon as curl exits.
+  if (( SHOW_BAR )); then
+    (
+      while true; do
+        sleep 0.5
+        draw_progress "$LABEL" "$VERSION" "$(file_size "$PARTIAL_PATH" 2>/dev/null || echo 0)" "$FILESIZE"
+      done
+    ) 9>&- &   # without the run lock, which its last sleep would hold on to briefly
+    POLLER_PID=$!
+    draw_progress "$LABEL" "$VERSION" 0 "$FILESIZE"
+  else
+    printf "⬇️  %s  iOS %s  downloading %s...\n" "$LABEL" "$VERSION" "$FILE_NAME"
+  fi
   printf '%s\n%s\n' "$FILE_NAME" "$FILESIZE" > "$PROGRESS_FILE"
 
   # Stream curl output through tee into the hash utility simultaneously.
@@ -622,9 +633,11 @@ download_unique() {
       -o "$PARTIAL_PATH" "$URL" 2>"$CURL_ERR" || CURL_OK=$?
   fi
 
-  kill "$POLLER_PID" 2>/dev/null
-  wait "$POLLER_PID" 2>/dev/null || true
-  POLLER_PID=""
+  if [[ -n "$POLLER_PID" ]]; then
+    kill "$POLLER_PID" 2>/dev/null
+    wait "$POLLER_PID" 2>/dev/null || true
+    POLLER_PID=""
+  fi
   rm -f "$PROGRESS_FILE"
 
   local RECEIVED CURL_MSG
@@ -634,14 +647,16 @@ download_unique() {
   CURL_ERR=""
 
   if (( CURL_OK != 0 )); then
-    printf "\n"
+    (( SHOW_BAR )) && printf "\n"
     [[ -n "$CURL_MSG" ]] && printf "%s\n" "$CURL_MSG" >&2
     download_failed "$LABEL" "$VERSION" "Download failed, or couldn't write it to the download folder (status $CURL_OK)"
     return
   fi
 
-  draw_progress "$LABEL" "$VERSION" "$FILESIZE" "$FILESIZE"
-  printf "\n"
+  if (( SHOW_BAR )); then
+    draw_progress "$LABEL" "$VERSION" "$FILESIZE" "$FILESIZE"
+    printf "\n"
+  fi
 
   # The hash captured during the download: did it arrive intact?
   if [[ -n "$HASH_CMD" && "$ACTUAL_HASH" != "$EXPECTED_HASH" ]]; then

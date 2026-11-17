@@ -119,12 +119,33 @@ def get_last_run(logs, running):
     return None
 
 
+LOG_TAIL_BYTES = 256 * 1024  # enough for the last 200 lines many times over
+_log_tail = {"key": None, "lines": []}  # last read: (inode, size, mtime) -> lines
+
+
 def get_log_tail(n=200):
+    """The last n lines of the log.
+
+    The log is never trimmed, so only its end is read, and only when it has
+    changed since the last poll.
+    """
     try:
-        lines = Path(LOG_FILE).read_text(encoding="utf-8", errors="replace").splitlines()
-        return lines[-n:]
+        with open(LOG_FILE, "rb") as f:
+            st = os.fstat(f.fileno())
+            key = (st.st_ino, st.st_size, st.st_mtime_ns)
+            cached = _log_tail
+            if cached["key"] == key:
+                return cached["lines"][-n:]
+            start = max(0, st.st_size - LOG_TAIL_BYTES)
+            f.seek(start)
+            data = f.read()
     except OSError:
         return []
+    if start > 0:
+        data = data.split(b"\n", 1)[-1]  # drop the line cut in half
+    lines = data.decode("utf-8", errors="replace").splitlines()[-n:]
+    _log_tail.update(key=key, lines=lines)
+    return lines
 
 
 def format_size(b):
@@ -972,7 +993,10 @@ function renderCalendar() {
   ).join("") : '<tr><td colspan="4" class="empty">No releases this month</td></tr>';
 }
 
+let calLoadedAt = 0;
+
 async function loadCalendar() {
+  calLoadedAt = Date.now();
   try {
     const d = await (await fetch("/api/calendar")).json();
     if (d.error) throw new Error(d.error);
@@ -988,8 +1012,14 @@ async function loadCalendar() {
 loadDevices();
 loadCalendar();
 refresh();
-setInterval(refresh, 5000);
-setInterval(loadCalendar, 3600 * 1000);
+// A tab in the background doesn't poll; it catches up when it's shown again.
+setInterval(() => { if (!document.hidden) refresh(); }, 5000);
+setInterval(() => { if (!document.hidden) loadCalendar(); }, 3600 * 1000);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  refresh();
+  if (Date.now() - calLoadedAt > 3600 * 1000) loadCalendar();
+});
 </script>
 </body>
 </html>
