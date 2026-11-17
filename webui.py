@@ -84,21 +84,20 @@ def _with_timeout(fn, *args, fallback):
         return fallback
 
 
-def is_manager_running():
+def current_run():
+    """"reverify" or "run" if ipsw-manager.sh is running, otherwise None."""
+    found = None
     for cmdline_path in glob.glob("/proc/[0-9]*/cmdline"):
         try:
-            data = (
-                Path(cmdline_path)
-                .read_bytes()
-                .replace(b"\x00", b" ")
-                .decode("utf-8", errors="replace")
-            )
-            # `--if-new` is the scheduler's quick look at ipsw.me, not a run.
-            if "ipsw-manager.sh" in data and "--if-new" not in data:
-                return True
+            args = Path(cmdline_path).read_bytes().decode("utf-8", errors="replace").split("\x00")
         except OSError:
-            pass
-    return False
+            continue
+        # `--if-new` is the scheduler's quick look at ipsw.me, not a run.
+        if any(a.endswith("ipsw-manager.sh") for a in args) and "--if-new" not in args:
+            if "--reverify" in args:
+                return "reverify"
+            found = "run"
+    return found
 
 
 def get_last_run(logs, running):
@@ -241,6 +240,8 @@ def read_verify_progress():
         speed = state.get("speed")
         return {
             "name": str(state["name"]),
+            # 2 while a file whose first read came back wrong is read again.
+            "read_pass": int(state.get("pass", 1)),
             "percent": min(100.0, done * 100 / total) if total > 0 else None,
             "speed": speed,
             "speed_human": format_size(speed) + "/s" if isinstance(speed, (int, float)) else None,
@@ -255,30 +256,49 @@ def read_verify_progress():
 _cache_entries = {}  # hash cache file name -> (its mtime, parsed entry)
 
 
+def _read_cached(path, parse):
+    """parse(text) of a small file in the hash cache, or None if it isn't there.
+
+    The cache is on the NAS, so each file is only read again when it changes.
+    """
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        _cache_entries.pop(path.name, None)
+        return None
+    known = _cache_entries.get(path.name)
+    if known and known[0] == mtime:
+        return known[1]
+    try:
+        entry = parse(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        entry = None
+    _cache_entries[path.name] = (mtime, entry)
+    return entry
+
+
+def _parse_hash(text):
+    fields = text.split()
+    return (int(fields[3]), int(fields[4])) if len(fields) >= 5 and fields[0] == "v2" else None
+
+
+def _parse_check_failed(text):
+    when, _, reason = text.strip().partition(" ")
+    return int(when), reason
+
+
 def read_cache_entry(cache):
     """(size in bytes, Unix time checked) from a hash cache file.
 
     None if the file isn't there or predates the read-back check: those
     entries only recorded the download's checksum, not the stored copy's.
-    The cache is on the NAS, so each file is only read again when it changes.
     """
-    try:
-        mtime = cache.stat().st_mtime_ns
-    except OSError:
-        _cache_entries.pop(cache.name, None)
-        return None
-    known = _cache_entries.get(cache.name)
-    if known and known[0] == mtime:
-        return known[1]
-    entry = None
-    try:
-        fields = cache.read_text(encoding="utf-8").split()
-        if len(fields) >= 5 and fields[0] == "v2":
-            entry = (int(fields[3]), int(fields[4]))
-    except (OSError, ValueError):
-        pass
-    _cache_entries[cache.name] = (mtime, entry)
-    return entry
+    return _read_cached(cache, _parse_hash)
+
+
+def read_check_failed(path):
+    """(Unix time, what went wrong) if the last attempt to check a file couldn't read it."""
+    return _read_cached(path, _parse_check_failed)
 
 
 def format_duration(seconds):
@@ -315,6 +335,8 @@ def get_downloads():
             # still the size it was then.
             entry = read_cache_entry(cache_path / (path.name + ".hash"))
             verified = entry is not None and entry[0] == stat.st_size
+            # The last attempt to check it couldn't read it; the next run tries again.
+            failed = read_check_failed(cache_path / (path.name + ".check-failed"))
             item = {
                 "name": path.name,
                 "identifiers": extract_identifiers(path.name),
@@ -327,6 +349,10 @@ def get_downloads():
                 "verified": verified,
                 "checked": datetime.fromtimestamp(entry[1], tz=timezone.utc).isoformat()
                 if verified else None,
+                "check_failed": {
+                    "at": datetime.fromtimestamp(failed[0], tz=timezone.utc).isoformat(),
+                    "reason": failed[1],
+                } if failed else None,
                 "version": extract_version(path.name),
             }
             if verifying and verifying["name"] == path.name:
@@ -375,25 +401,69 @@ def get_downloads():
     return results
 
 
+START_WAIT = 10  # seconds to wait for a run to take the run lock
+
+
+def _changed_since(path, when):
+    try:
+        return os.stat(path).st_mtime >= when
+    except OSError:
+        return False
+
+
 def trigger_run(reverify=False):
-    if is_manager_running():
+    """Start a run. Returns (started, message) once the run holds the run lock.
+
+    The scheduler can start one at the same moment, so the run itself is
+    the judge: one that gets the lock writes RUN_STARTED_FILE; one that
+    doesn't exits 0 without writing it or LAST_RUN_FILE; one that can't
+    start (the download folder looks unmounted, say) records why in
+    LAST_RUN_FILE and exits non-zero.
+    """
+    if current_run():
         return False, "Already running"
     if not _run_lock.acquire(blocking=False):
         return False, "Already running"
+    launched = time.time() - 0.05  # file times can lag the clock by a tick
+    try:
+        # --reverify reads every stored file back and checks it, however
+        # recently it was checked; only the ones that fail are downloaded again.
+        proc = subprocess.Popen(
+            ["/usr/local/bin/ipsw-manager.sh"] + (["--reverify"] if reverify else []),
+            start_new_session=True,
+        )
+    except OSError as exc:
+        _run_lock.release()
+        return False, f"Couldn't start a run: {exc}"
 
-    def run():
+    def reap():
         try:
-            # --reverify reads every stored file back and checks it; only
-            # the ones that fail are downloaded again.
-            subprocess.run(
-                ["/usr/local/bin/ipsw-manager.sh"] + (["--reverify"] if reverify else []),
-                start_new_session=True,
-            )
+            proc.wait()
         finally:
             _run_lock.release()
 
-    threading.Thread(target=run, daemon=True).start()
-    return True, "Started"
+    threading.Thread(target=reap, daemon=True).start()
+
+    deadline = time.monotonic() + START_WAIT
+    while time.monotonic() < deadline:
+        if _changed_since(RUN_STARTED_FILE, launched):
+            return True, "Started"
+        status = proc.poll()
+        if status is not None:
+            if _changed_since(LAST_RUN_FILE, launched):
+                if status == 0:
+                    return True, "Started"  # and already finished
+                try:
+                    why = Path(LAST_RUN_FILE).read_text(encoding="utf-8").strip()
+                    why = re.sub(r"^\S+Z\s+", "", why)
+                except OSError:
+                    why = f"it stopped with status {status}"
+                return False, f"Couldn't start the run: {why}"
+            if status == 0:
+                return False, "Another run is already in progress"
+            return False, f"Couldn't start the run (status {status})"
+        time.sleep(0.1)
+    return True, "Started"  # still going, perhaps held up by a slow NAS
 
 
 _device_cache = {"at": 0.0, "devices": []}
@@ -674,8 +744,8 @@ tr:hover td{background:rgba(255,255,255,.025)}
   <span id="poll-ts" style="font-size:11px;color:#484f58;margin-left:8px"></span>
   <div class="spacer"></div>
   <div class="hdr-actions">
-    <button id="btn-run" class="btn-green" onclick="doRun(false)">&#9654; Run Now</button>
-    <button id="btn-verify" class="btn-gray" onclick="doRun(true)">&#8635; Re-verify</button>
+    <button id="btn-run" class="btn-green" onclick="doRun(false)" title="Download new firmware, check files that are due a check, and delete IPSWs that are no longer needed">&#9654; Run Now</button>
+    <button id="btn-verify" class="btn-gray" onclick="doRun(true)" title="Run Now, and also read every stored file back and check it, however recently it was checked">&#8635; Re-verify</button>
   </div>
 </header>
 <main>
@@ -776,7 +846,7 @@ async function refresh() {
 
   const running = d.running;
   document.getElementById("dot").className = running ? "running" : "";
-  document.getElementById("status-lbl").textContent = running ? "Running…" : "Idle";
+  document.getElementById("status-lbl").textContent = !running ? "Idle" : d.reverifying ? "Re-verifying…" : "Running…";
   document.getElementById("btn-run").disabled = running;
   document.getElementById("btn-verify").disabled = running;
 
@@ -788,10 +858,15 @@ async function refresh() {
       const badge = f.status === "downloading"
         ? '<span class="badge badge-blue">⬇ Downloading</span>'
         : f.status === "verifying"
-          ? '<span class="badge badge-blue" title="Reading the stored file back and checking it against its checksum">🔍 Verifying</span>'
-          : f.verified
-            ? '<span class="badge badge-green" title="The copy in the download folder was read back and matched its checksum on ' + esc(fmt(f.checked)) + '">✓ Verified</span>'
-            : '<span class="badge badge-orange" title="Not yet read back from the download folder and checked. The next run, or Re-verify, will do it.">? Not checked</span>';
+          ? '<span class="badge badge-blue" title="' + (f.read_pass > 1
+              ? "The first read didn't match its checksum. Reading it again to tell a damaged file from a bad read."
+              : "Reading the stored file back and checking it against its checksum") + '">🔍 Verifying</span>'
+          : f.check_failed
+            ? '<span class="badge badge-orange" title="' + esc("Couldn't be read back to check it on " + fmt(f.check_failed.at) + ": " + f.check_failed.reason
+                + (f.verified ? ". Last verified " + fmt(f.checked) : ". Never verified") + ". The next run tries again.") + '">⚠ Check failed</span>'
+            : f.verified
+              ? '<span class="badge badge-green" title="The copy in the download folder was read back and matched its checksum on ' + esc(fmt(f.checked)) + '">✓ Verified</span>'
+              : '<span class="badge badge-orange" title="Not yet read back from the download folder and checked. The next run, or Re-verify, will do it.">? Not checked</span>';
       return '<tr>'
         + '<td class="model" title="' + esc(f.name) + '">' + esc(f.model || f.identifiers.join(", ") || f.name) + '</td>'
         + '<td class="mono">' + esc(f.identifiers.join(", ") || "—") + '</td>'
@@ -816,6 +891,7 @@ async function refresh() {
 function speedLabel(f) {
   if (f.status !== "downloading" && f.status !== "verifying") return "";
   const parts = [];
+  if (f.status === "verifying" && f.read_pass > 1) parts.push("second read");
   if (f.percent != null) parts.push(Math.floor(f.percent) + "%");
   parts.push(f.speed_human || "measuring…");
   if (f.eta_human) parts.push(f.eta_human);
@@ -827,7 +903,11 @@ function speedLabel(f) {
 
 async function doRun(reverify) {
   if (reverify && !confirm(
-    "Re-verify reads every firmware file back from the download folder and checks it against its checksum. Any that fail are downloaded again.\\n\\nOver gigabit Ethernet this takes a minute or two per file. Continue?"
+    "Re-verify does everything Run Now does, and also reads every stored firmware file back from the download folder and checks it against its checksum, however recently it was checked.\\n\\n"
+    + "• A file that fails is deleted and downloaded again.\\n"
+    + "• As with Run Now, new firmware is downloaded, and IPSWs that are no longer current or belong to phones you've unticked are deleted.\\n"
+    + "• If ipsw.me can't be reached, files are checked against the checksum saved when they last passed.\\n\\n"
+    + "It takes about as long as copying every file off the download folder: a minute or two per file. Continue?"
   )) return;
 
   document.getElementById("btn-run").disabled = true;
@@ -1058,7 +1138,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path == "/api/status":
-            running = is_manager_running()
+            run = current_run()
+            running = run is not None
             downloads = _with_timeout(get_downloads, fallback=[])
             names = device_names()
             for f in downloads:
@@ -1068,6 +1149,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(
                 {
                     "running": running,
+                    "reverifying": run == "reverify",
                     "downloads": downloads,
                     "logs": logs,
                     "last_run": last_run,

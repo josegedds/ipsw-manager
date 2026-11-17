@@ -145,7 +145,9 @@ wanted_urls() {
 # "run when a new iOS version is out" means asking often; this is the cheap
 # way to ask. It only talks to ipsw.me, reads nothing from the NAS beyond the
 # phone selection, and writes nothing to the log unless it starts a run.
-# It also starts one when the stored files are due to be checked again.
+# It also starts one when the stored files are due to be checked again, and
+# when the last run didn't finish cleanly (a download failed, say), so a
+# phone left without its IPSW gets it as soon as that can work.
 # ---------------------------------------------------------------------------
 
 recheck_due() {
@@ -181,10 +183,14 @@ if [[ "${1:-}" == "--if-new" ]]; then
     REASON="New firmware on ipsw.me, or the phone selection changed"
   elif recheck_due; then
     REASON="The stored firmware is due to be checked again"
+  elif [[ -f "$ATTEMPTED_FILE" ]]; then
+    # Only a run that finished cleanly turns it into $SYNCED_FILE.
+    REASON="Trying again: the last run didn't finish cleanly"
   else
     exit 0
   fi
-  # A run for exactly this firmware didn't finish cleanly a short while ago.
+  # A run for exactly this firmware didn't finish cleanly a short while ago:
+  # wait RETRY_MINUTES before trying again.
   if [[ -f "$ATTEMPTED_FILE" && "$WANTED" == "$(cat "$ATTEMPTED_FILE")" \
         && -n "$(find "$ATTEMPTED_FILE" -mmin "-${RETRY_MINUTES}" 2>/dev/null)" ]]; then
     exit 0
@@ -423,12 +429,6 @@ done
 UNIQUE_COUNT=${#URL_DEVICES[@]}
 log "🗂  Deduplicated to $UNIQUE_COUNT unique firmware files (from ${#DEVICES[@]} device identifiers)"
 
-# Nothing signed found usually means the API calls failed — don't let the
-# cleanup step wipe the download folder on that basis.
-if (( UNIQUE_COUNT == 0 )); then
-  finish 0 "⚠️  No signed firmware found for the selected phones — skipping download and cleanup."
-fi
-
 # Phase 2: check / download each unique URL one at a time.
 #
 # A file counts as verified only once the copy in the download folder has been
@@ -460,6 +460,20 @@ note() {
 write_cache() {
   local CACHE_FILE="$1" ALGO="$2" HASH="$3" SIZE="$4"
   printf "v2 %s %s %s %s\n" "$ALGO" "$HASH" "$SIZE" "$(date +%s)" > "$CACHE_FILE"
+  rm -f "${CACHE_FILE%.hash}.check-failed"
+}
+
+# Records that a stored file couldn't be read back to check it, for the web
+# UI, and so the next run checks it again however recent its last good check
+# is. One line: <when, Unix time> <what went wrong>. Removed by write_cache.
+mark_check_failed() {
+  local FILE_NAME="$1" REASON="$2"
+  printf "%s %s\n" "$(date +%s)" "$REASON" > "$HASH_CACHE_DIR/${FILE_NAME}.check-failed" 2>/dev/null || true
+}
+
+# Deletes a stored IPSW and everything recorded about it.
+forget_file() {
+  rm -f "$DOWNLOAD_DIR/$1" "$HASH_CACHE_DIR/$1.hash" "$HASH_CACHE_DIR/$1.check-failed"
 }
 
 # The oldest check among the files kept, for REVERIFY_DUE_FILE.
@@ -557,6 +571,41 @@ file_size() {
 DOWNLOAD_FAILURES=0
 # Stored files that couldn't be read back to check. They're left alone.
 CHECK_FAILURES=0
+
+# For the summary on the run's last line (see run_summary).
+N_DOWNLOADED=0     # downloads that passed their checks, replacements included
+N_READBACK=0       # stored files read back: OK + damaged + CHECK_FAILURES
+N_READ_OK=0
+N_READ_DAMAGED=0
+N_WRONG_SIZE=0     # stored files no longer the size they were when checked
+N_REPLACED=0       # damaged files downloaded again
+N_NOT_REPLACED=0   # damaged files deleted and not (yet) downloaded again
+
+# What the run did, appended to its last line, e.g.
+# " Downloaded 1. Read back 3: 2 OK, 1 damaged. Replaced 1 damaged file(s)."
+run_summary() {
+  local S="" NEW=$(( N_DOWNLOADED - N_REPLACED )) PARTS=() P
+  (( NEW > 0 )) && S+=" Downloaded ${NEW}."
+  if (( N_READBACK > 0 )); then
+    PARTS=("${N_READ_OK} OK")
+    (( N_READ_DAMAGED > 0 )) && PARTS+=("${N_READ_DAMAGED} damaged")
+    (( CHECK_FAILURES > 0 )) && PARTS+=("${CHECK_FAILURES} couldn't be read")
+    S+=" Read back ${N_READBACK}: ${PARTS[0]}"
+    for P in "${PARTS[@]:1}"; do S+=", $P"; done
+    S+="."
+  fi
+  (( N_WRONG_SIZE > 0 )) && S+=" ${N_WRONG_SIZE} had the wrong size."
+  (( N_REPLACED > 0 )) && S+=" Replaced ${N_REPLACED} damaged file(s)."
+  (( N_NOT_REPLACED > 0 )) && S+=" ${N_NOT_REPLACED} damaged file(s) deleted and not downloaded again yet."
+  printf '%s' "$S"
+}
+
+# When the scheduled checks will try a run that didn't finish cleanly again.
+retry_note() {
+  if [[ "${CHECK_INTERVAL:-0}" =~ ^[1-9][0-9]*$ ]]; then
+    printf ' Trying again in about %s min.' "$RETRY_MINUTES"
+  fi
+}
 
 download_failed() {
   local LABEL="$1" VERSION="$2" REASON="$3"
@@ -704,7 +753,19 @@ download_unique() {
   CURRENT_PARTIAL=""
   write_cache "$CACHE_FILE" "$HASH_ALGO" "$EXPECTED_HASH" "$ON_DISK"
   track_checked "$(date +%s)"
+  (( N_DOWNLOADED++ )) || true
   note "✅ [$LABEL]: iOS $VERSION downloaded and verified in the download folder ($(checked_how "$HASH_ALGO"))"
+}
+
+# Downloads a damaged file again, counting whether that worked.
+replace_damaged() {
+  local BEFORE="$DOWNLOAD_FAILURES"
+  download_unique "$@"
+  if (( DOWNLOAD_FAILURES == BEFORE )); then
+    (( N_REPLACED++ )) || true
+  else
+    (( N_NOT_REPLACED++ )) || true
+  fi
 }
 
 # A file that's already in the download folder: read it back and check it.
@@ -719,24 +780,28 @@ verify_existing() {
 
   printf "🔍 [%s]: Checking %s in the download folder...\n" "$LABEL" "$FILE_NAME"
   check_on_disk "$FILE_PATH" "$FILE_NAME" "$EXPECTED_HASH" "$HASH_ALGO"
+  (( N_READBACK++ )) || true
   case "$V_STATUS" in
     ok|reread-ok)
       [[ "$V_STATUS" == "reread-ok" ]] && warn_reread "$LABEL" "$FILE_NAME"
       write_cache "$CACHE_FILE" "$HASH_ALGO" "$EXPECTED_HASH" "$(file_size "$FILE_PATH")"
       track_checked "$(date +%s)"
+      (( N_READ_OK++ )) || true
       note "✅ [$LABEL]: iOS $VERSION verified in the download folder ($(checked_how "$HASH_ALGO"))"
       ;;
     mismatch)
+      (( N_READ_DAMAGED++ )) || true
       if [[ "$HASH_ALGO" == "zip" ]]; then
         note "❌ [$LABEL]: $FILE_NAME is damaged: $V_INFO — downloading it again"
       else
         note "❌ [$LABEL]: $FILE_NAME is damaged ($HASH_ALGO is $V_HASH, should be $EXPECTED_HASH) — downloading it again"
       fi
-      rm -f "$FILE_PATH" "$CACHE_FILE"
-      download_unique "$@"
+      forget_file "$FILE_NAME"
+      replace_damaged "$@"
       ;;
     *)
       (( CHECK_FAILURES++ )) || true
+      mark_check_failed "$FILE_NAME" "$V_INFO"
       note "❌ [$LABEL]: Couldn't check $FILE_NAME: $V_INFO — left as it is, will retry next run"
       ;;
   esac
@@ -771,11 +836,12 @@ process_unique() {
     ON_DISK=$(file_size "$FILE_PATH")
     if [[ "$ON_DISK" != "$C_SIZE" ]]; then
       note "⚠️  [$LABEL]: $FILE_NAME is $ON_DISK bytes but was $C_SIZE when it was checked — downloading it again"
-      rm -f "$FILE_PATH" "$CACHE_FILE"
-      download_unique "$@"
+      (( N_WRONG_SIZE++ )) || true
+      forget_file "$FILE_NAME"
+      replace_damaged "$@"
       return
     fi
-    if (( ! FORCE_REVERIFY )) \
+    if (( ! FORCE_REVERIFY )) && [[ ! -e "$HASH_CACHE_DIR/${FILE_NAME}.check-failed" ]] \
        && (( REVERIFY_DAYS == 0 || $(date +%s) - C_WHEN < REVERIFY_DAYS * 86400 )); then
       track_checked "$C_WHEN"
       note "✅ [$LABEL]: Already verified, checked $(days_ago "$C_WHEN") (iOS $VERSION)"
@@ -783,9 +849,81 @@ process_unique() {
     fi
   fi
   # Never read back (it predates that check, or the cache was cleared), the
-  # checksum on ipsw.me has changed, or the last check is old.
+  # checksum on ipsw.me has changed, the last check is old, or the last
+  # attempt to check it couldn't read it.
   RECHECK+=("$URL")
 }
+
+# When ipsw.me didn't answer for some phones, their firmware isn't in the
+# manifest, so the loop above didn't look at their files. Cleanup is skipped,
+# so the files are kept; this checks the ones that are due (or all of them,
+# with --reverify) against the checksum saved when they last passed. A file
+# with no saved checksum has to wait for ipsw.me.
+check_unlisted() {
+  local FILE FILE_NAME LABEL CACHE_FILE ON_DISK UNSAVED=0
+  local C_VER C_ALGO C_HASH C_SIZE C_WHEN
+  for FILE in "$DOWNLOAD_DIR"/*.ipsw; do
+    [[ -e "$FILE" ]] || continue
+    FILE_NAME=$(basename "$FILE")
+    grep -qxF "$FILE_NAME" "$TMP_FILE" && continue   # in the manifest: done above
+    CACHE_FILE="$HASH_CACHE_DIR/${FILE_NAME}.hash"
+    C_VER="" C_ALGO="" C_HASH="" C_SIZE="" C_WHEN=""
+    if [[ -f "$CACHE_FILE" ]]; then
+      read -r C_VER C_ALGO C_HASH C_SIZE C_WHEN < "$CACHE_FILE" || true
+    fi
+    if [[ "$C_VER" != "v2" || ! "$C_WHEN" =~ ^[0-9]+$ || -z "$C_HASH" ]]; then
+      (( FORCE_REVERIFY )) && { (( UNSAVED++ )) || true; }
+      continue
+    fi
+    if (( ! FORCE_REVERIFY )) && [[ ! -e "$HASH_CACHE_DIR/${FILE_NAME}.check-failed" ]] \
+       && (( REVERIFY_DAYS == 0 || $(date +%s) - C_WHEN < REVERIFY_DAYS * 86400 )); then
+      continue
+    fi
+    LABEL="${FILE_NAME%%_*}"
+    ON_DISK=$(file_size "$FILE")
+    if [[ "$ON_DISK" != "$C_SIZE" ]]; then
+      note "❌ [$LABEL]: $FILE_NAME is $ON_DISK bytes but was $C_SIZE when it was checked — deleted. A run once ipsw.me answers downloads it again if it's still current."
+      (( N_WRONG_SIZE++, N_NOT_REPLACED++ )) || true
+      forget_file "$FILE_NAME"
+      continue
+    fi
+    printf "🔍 [%s]: Checking %s against its saved checksum, as ipsw.me didn't answer...\n" "$LABEL" "$FILE_NAME"
+    check_on_disk "$FILE" "$FILE_NAME" "$C_HASH" "$C_ALGO"
+    (( N_READBACK++ )) || true
+    case "$V_STATUS" in
+      ok|reread-ok)
+        [[ "$V_STATUS" == "reread-ok" ]] && warn_reread "$LABEL" "$FILE_NAME"
+        write_cache "$CACHE_FILE" "$C_ALGO" "$C_HASH" "$ON_DISK"
+        (( N_READ_OK++ )) || true
+        note "✅ [$LABEL]: $FILE_NAME verified against the checksum saved when it last passed ($(checked_how "$C_ALGO"))"
+        ;;
+      mismatch)
+        (( N_READ_DAMAGED++, N_NOT_REPLACED++ )) || true
+        note "❌ [$LABEL]: $FILE_NAME is damaged ($([[ "$C_ALGO" == zip ]] && echo "$V_INFO" || echo "$C_ALGO is $V_HASH, should be $C_HASH")) — deleted. A run once ipsw.me answers downloads it again if it's still current."
+        forget_file "$FILE_NAME"
+        ;;
+      *)
+        (( CHECK_FAILURES++ )) || true
+        mark_check_failed "$FILE_NAME" "$V_INFO"
+        note "❌ [$LABEL]: Couldn't check $FILE_NAME: $V_INFO — left as it is, will retry next run"
+        ;;
+    esac
+  done
+  if (( UNSAVED > 0 )); then
+    note "⚠️  ${UNSAVED} stored file(s) have no saved checksum, so they can't be checked until ipsw.me answers."
+  fi
+}
+
+# Nothing signed found usually means the API calls failed — don't let the
+# cleanup step wipe the download folder on that basis.
+if (( UNIQUE_COUNT == 0 )); then
+  FAILED=("$META_DIR"/*.failed)
+  if [[ -e "${FAILED[0]}" ]]; then
+    check_unlisted
+    finish 1 "⚠️  Firmware lookup failed for ${#FAILED[@]} phone(s) — skipping download and cleanup.$(run_summary)$(retry_note)"
+  fi
+  finish 0 "⚠️  No signed firmware found for the selected phones — skipping download and cleanup."
+fi
 
 # We hold the lock, so any .partial is left over from a run that was killed.
 rm -f "$DOWNLOAD_DIR"/*.ipsw.partial
@@ -817,7 +955,8 @@ fi
 
 FAILED=("$META_DIR"/*.failed)
 if [[ -e "${FAILED[0]}" ]]; then
-  finish 1 "⚠️  Firmware lookup failed for ${#FAILED[@]} phone(s) — skipping cleanup so their IPSWs aren't deleted."
+  check_unlisted
+  finish 1 "⚠️  Firmware lookup failed for ${#FAILED[@]} phone(s) — skipping cleanup so their IPSWs aren't deleted.$(run_summary)$(retry_note)"
 fi
 
 if (( DOWNLOAD_FAILURES > 0 || CHECK_FAILURES > 0 )); then
@@ -826,7 +965,9 @@ if (( DOWNLOAD_FAILURES > 0 || CHECK_FAILURES > 0 )); then
   (( CHECK_FAILURES > 0 )) && PROBLEMS+=("${CHECK_FAILURES} stored file(s) couldn't be checked")
   SUMMARY="${PROBLEMS[0]}"
   (( ${#PROBLEMS[@]} > 1 )) && SUMMARY+=" and ${PROBLEMS[1]}"
-  finish 1 "⚠️  ${SUMMARY} — skipping cleanup so those phones keep their current IPSWs."
+  # Cleanup would delete the IPSW a phone has while its new one is missing.
+  # (A damaged file has already been deleted, so the run's summary says so.)
+  finish 1 "⚠️  ${SUMMARY} — skipping cleanup, so old IPSWs are kept for now.$(run_summary)$(retry_note)"
 fi
 
 log "🧹 Cleaning up old IPSWs..."
@@ -839,7 +980,7 @@ for FILE in "$DOWNLOAD_DIR"/*.ipsw; do
   BASENAME=$(basename "$FILE")
   if [[ ! " ${KEEP_FILES[*]} " =~ " $BASENAME " ]]; then
     log "🗑  Removed $BASENAME"
-    rm -f "$FILE" "$HASH_CACHE_DIR/${BASENAME}.hash"
+    forget_file "$BASENAME"
     (( REMOVED++ )) || true
   fi
 done
@@ -854,4 +995,4 @@ else
   rm -f "$REVERIFY_DUE_FILE"
 fi
 
-finish 0 "✅ Done — ${#KEEP_FILES[@]} file(s) retained, $REMOVED removed."
+finish 0 "✅ Done — ${#KEEP_FILES[@]} file(s) retained, $REMOVED removed.$(run_summary)"
