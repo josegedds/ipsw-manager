@@ -65,6 +65,9 @@ ATTEMPTED_FILE="${STATE_DIR}/ipsw-manager-attempted"
 REVERIFY_DUE_FILE="${STATE_DIR}/ipsw-manager-reverify-due"
 # What the helper is reading back and how far it has got, for the web UI.
 VERIFY_PROGRESS_FILE="${STATE_DIR}/ipsw-manager-verify"
+# Written by the web UI's Stop button just before it signals the run, so the
+# run reports that it was stopped rather than that it failed.
+STOP_REQUEST_FILE="${STATE_DIR}/ipsw-manager-stop-requested"
 # After a run that didn't finish cleanly, `--if-new` waits this many minutes
 # (counted from when the run ended) before trying the same firmware again.
 RETRY_MINUTES="${IPSW_RETRY_MINUTES:-60}"
@@ -217,6 +220,7 @@ FORCE_REVERIFY=0
 
 RESULT=""          # one-line outcome, set by finish()
 ABORTED_AT=""      # set by the ERR trap: the command that failed
+STOPPED_BY_USER=0  # set when the web UI's Stop button ended the run
 LOG_READY=0        # the download folder checked out, so the log may be written
 CURRENT_PARTIAL="" # .partial being written, removed if the run dies
 POLLER_PID=""
@@ -236,8 +240,20 @@ on_exit() {
   rm -f "${TMP_FILE:-}" "${PROGRESS_FILE:-}" "${CURL_ERR:-}" "$VERIFY_PROGRESS_FILE"
   [[ -n "${META_DIR:-}" ]] && rm -rf "$META_DIR"
 
+  # Stop signals the run's commands too. If one of them died first, the ERR
+  # trap has already called it a failure; the request file says otherwise.
+  if [[ -f "$STOP_REQUEST_FILE" ]]; then
+    rm -f "$STOP_REQUEST_FILE"
+    [[ -n "$ABORTED_AT" ]] && STOPPED_BY_USER=1
+  fi
+
   if [[ -n "$ABORTED_AT" ]]; then
-    RESULT="❌ Run aborted (status $STATUS) — $ABORTED_AT"
+    if (( STOPPED_BY_USER )); then
+      # run_summary is defined further down, so a run stopped early may not have it yet.
+      RESULT="⏹  Run stopped from the web UI.$(declare -F run_summary >/dev/null && run_summary)"
+    else
+      RESULT="❌ Run aborted (status $STATUS) — $ABORTED_AT"
+    fi
     printf "%s  %s\n" "$(timestamp)" "$RESULT" >&2
     # Best effort, in the background, so a hung NAS can't hang the exit.
     # fd 9 is the run lock; closing it stops a stuck write from holding it.
@@ -262,7 +278,13 @@ on_exit() {
 on_err() { ABORTED_AT="line $1: $2. Is the download folder reachable?"; }
 
 on_signal() {
-  ABORTED_AT="stopped by $1 (timed out after ${RUN_TIMEOUT}, or the container is stopping)"
+  if [[ -f "$STOP_REQUEST_FILE" ]]; then
+    rm -f "$STOP_REQUEST_FILE"
+    STOPPED_BY_USER=1
+    ABORTED_AT="stopped from the web UI"
+  else
+    ABORTED_AT="stopped by $1 (timed out after ${RUN_TIMEOUT}, or the container is stopping)"
+  fi
   exit 143
 }
 
@@ -320,8 +342,17 @@ fi
 # Left behind only if this run is killed outright. The web UI then reports
 # that the run didn't finish.
 timestamp > "$RUN_STARTED_FILE"
+rm -f "$STOP_REQUEST_FILE"  # left over from a Stop that came too late
 
-[[ -n "${_IPSW_REASON:-}" ]] && log "🆕 ${_IPSW_REASON} — starting a run."
+# The web UI's run history starts each run at this line.
+if [[ -n "${_IPSW_REASON:-}" ]]; then
+  TRIGGER="$_IPSW_REASON"
+elif [[ "${_IPSW_TRIGGER:-}" == web ]]; then
+  TRIGGER="Started from the web UI"
+else
+  TRIGGER="Started by CRON_SCHEDULE or by hand"
+fi
+log "▶️  Run started — ${TRIGGER}."
 (( FORCE_REVERIFY )) && log "🔍 Re-verify — every stored file will be read back and checked."
 
 # Nothing can be marked verified without it, so don't start.

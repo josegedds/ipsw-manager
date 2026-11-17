@@ -9,6 +9,7 @@ import http.server
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -41,6 +42,13 @@ FIRMWARE_CACHE_TTL = 3600  # seconds to keep each phone's signed firmware from i
 FIRMWARE_RETRY_AFTER = 300  # seconds before looking a phone up again after a failed lookup
 IDENTIFIER_RE = re.compile(r"^iPhone(\d+),(\d+)$")
 MAX_POST_BODY = 64 * 1024
+# As ipsw-manager.sh reads it: a stored file is checked again once its last
+# check is this many days old; 0 means only when it's downloaded.
+_reverify = os.environ.get("IPSW_REVERIFY_DAYS", "30")
+REVERIFY_DAYS = int(_reverify) if _reverify.isdigit() else 30
+# Download links for stored IPSWs. They're public files from Apple, so the
+# only cost of leaving them on is bandwidth. WEBUI_DOWNLOADS=0 turns them off.
+DOWNLOAD_LINKS = os.environ.get("WEBUI_DOWNLOADS", "1").strip().lower() not in ("0", "off", "false", "no")
 
 _run_lock = threading.Lock()
 _io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="ipsw-io")
@@ -59,9 +67,12 @@ VERIFY_PROGRESS_FILE = os.path.join(STATE_DIR, "ipsw-manager-verify")
 # that hasn't finished (left behind if it was killed).
 LAST_RUN_FILE = os.path.join(STATE_DIR, "ipsw-manager-last-run")
 RUN_STARTED_FILE = os.path.join(STATE_DIR, "ipsw-manager-run-started")
+# Written just before Stop signals a run, so it reports being stopped, not failing.
+STOP_REQUEST_FILE = os.path.join(STATE_DIR, "ipsw-manager-stop-requested")
 # Log lines that end a run, for when LAST_RUN_FILE doesn't exist yet.
 RUN_END_MARKERS = ("✅ Done", "Run aborted", "skipping cleanup", "stopping without changes",
-                   "skipping download and cleanup", "missing its .ipsw-manager marker")
+                   "skipping download and cleanup", "missing its .ipsw-manager marker",
+                   "Run stopped from the web UI")
 
 _speed_samples = {}  # .partial file name -> deque of (monotonic time, size)
 _speed_lock = threading.Lock()
@@ -149,6 +160,72 @@ def get_log_tail(n=200):
     lines = data.decode("utf-8", errors="replace").splitlines()[-n:]
     _log_tail.update(key=key, lines=lines)
     return lines
+
+
+LOG_LINE_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s+(.*)$")
+# The line each run starts with, and the one older versions logged for runs
+# started by the scheduler's check.
+RUN_START_RE = re.compile(r"^(?:▶️?\s+Run started — (.*?)\.?|🆕 (.*) — starting a run\.)$")
+HISTORY_MAX = 30
+HISTORY_SCAN_BYTES = 4 * 1024 * 1024  # how far back to look the first time
+_history = {}
+_history_lock = threading.Lock()
+
+
+def _history_reset(inode, offset):
+    _history.clear()
+    _history.update(inode=inode, offset=offset, partial=b"", skip_first=offset > 0,
+                    runs=collections.deque(maxlen=HISTORY_MAX), open=None)
+
+
+def _history_line(line):
+    m = LOG_LINE_RE.match(line)
+    if not m:
+        return
+    at, msg = m.groups()
+    start = RUN_START_RE.match(msg)
+    if start:
+        if _history["open"]:
+            # Started, then nothing until the next run: it was killed outright.
+            _history["runs"].append(dict(_history["open"]))
+        _history["open"] = {"started": at, "ended": None, "trigger": start.group(1) or start.group(2),
+                            "reverify": False, "outcome": None}
+    elif msg.startswith("🔍 Re-verify") and _history["open"]:
+        _history["open"]["reverify"] = True
+    elif any(marker in msg for marker in RUN_END_MARKERS):
+        run = _history["open"] or {"started": None, "trigger": None, "reverify": False}
+        _history["runs"].append(dict(run, ended=at, outcome=msg))
+        _history["open"] = None
+
+
+def read_run_history():
+    """(finished runs, newest first; a run the log shows as started but not ended, or None).
+
+    Built from the log's start and end lines. Only what was added to the log
+    since the last poll is read.
+    """
+    with _history_lock:
+        try:
+            with open(LOG_FILE, "rb") as f:
+                st = os.fstat(f.fileno())
+                if _history.get("inode") != st.st_ino or st.st_size < _history["offset"]:
+                    _history_reset(st.st_ino, max(0, st.st_size - HISTORY_SCAN_BYTES))
+                if st.st_size > _history["offset"]:
+                    f.seek(_history["offset"])
+                    data = f.read(st.st_size - _history["offset"])
+                    _history["offset"] += len(data)
+                    lines = (_history["partial"] + data).split(b"\n")
+                    _history["partial"] = lines.pop()  # not finished being written
+                    if _history["skip_first"]:
+                        lines = lines[1:]  # cut in half by starting mid-file
+                        _history["skip_first"] = False
+                    for raw in lines:
+                        _history_line(raw.decode("utf-8", errors="replace"))
+        except OSError:
+            pass
+        if not _history:
+            return [], None
+        return list(reversed(_history["runs"])), dict(_history["open"]) if _history["open"] else None
 
 
 def format_size(b):
@@ -369,9 +446,13 @@ def scan_download_dir():
                 stat.st_mtime, tz=timezone.utc
             ).isoformat(),
             "status": "complete",
+            "partial": False,
             "verified": verified,
             "checked": datetime.fromtimestamp(entry[1], tz=timezone.utc).isoformat()
             if verified else None,
+            # When a run will next read it back (see IPSW_REVERIFY_DAYS).
+            "next_check": datetime.fromtimestamp(entry[1] + REVERIFY_DAYS * 86400, tz=timezone.utc).isoformat()
+            if verified and REVERIFY_DAYS else None,
             "check_failed": {
                 "at": datetime.fromtimestamp(failed[0], tz=timezone.utc).isoformat(),
                 "reason": failed[1],
@@ -402,6 +483,7 @@ def scan_download_dir():
             "size_human": format_size(stat.st_size),
             "mtime": None,
             "status": "downloading",
+            "partial": True,  # still .partial: being downloaded, or checked before it's renamed
             "verified": False,
             "version": extract_version(ipsw_name),
             "speed": speed,
@@ -524,6 +606,7 @@ def trigger_run(reverify=False):
         proc = subprocess.Popen(
             ["/usr/local/bin/ipsw-manager.sh"] + (["--reverify"] if reverify else []),
             start_new_session=True,
+            env=dict(os.environ, _IPSW_TRIGGER="web"),  # for the run's "started" line
         )
     except OSError as exc:
         _run_lock.release()
@@ -557,6 +640,93 @@ def trigger_run(reverify=False):
             return False, f"Couldn't start the run (status {status})"
         time.sleep(0.1)
     return True, "Started"  # still going, perhaps held up by a slow NAS
+
+
+def _processes():
+    """pid -> (parent pid, command line) for every process in the container."""
+    procs = {}
+    for stat_path in glob.glob("/proc/[0-9]*/stat"):
+        pid = int(stat_path.split("/")[2])
+        try:
+            stat = Path(stat_path).read_text(encoding="utf-8", errors="replace")
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])  # the name in brackets may hold spaces
+            args = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", errors="replace").split("\x00")
+        except (OSError, ValueError, IndexError):
+            continue
+        procs[pid] = (ppid, args)
+    return procs
+
+
+def _remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def stop_run():
+    """Stop the run in progress. Returns (stopping, message).
+
+    Every process of the run gets SIGTERM: the script, its timeout wrapper,
+    and whatever they're running (curl, the read-back check). Signalling the
+    script alone would leave it waiting for a download to finish first. The
+    script then removes its half-written file and records that it was stopped.
+    """
+    procs = _processes()
+    roots = [pid for pid, (_, args) in procs.items()
+             if any(a.endswith("ipsw-manager.sh") for a in args) and "--if-new" not in args]
+    if not roots:
+        _remove(STOP_REQUEST_FILE)
+        return False, "No run is in progress"
+    children = collections.defaultdict(list)
+    for pid, (ppid, _) in procs.items():
+        children[ppid].append(pid)
+    targets, stack = [], list(roots)
+    while stack:
+        pid = stack.pop()
+        if pid not in targets and pid != os.getpid():
+            targets.append(pid)
+            stack.extend(children[pid])
+    try:
+        Path(STOP_REQUEST_FILE).write_text(f"{time.time()}\n", encoding="utf-8")
+    except OSError as exc:
+        return False, f"Couldn't stop the run: {exc}"
+    signalled = denied = 0
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            signalled += 1
+        except ProcessLookupError:
+            pass  # already gone
+        except PermissionError:
+            denied += 1
+    if not signalled:
+        _remove(STOP_REQUEST_FILE)
+        if denied:
+            return False, ("Couldn't stop the run: it belongs to another user. A run started with "
+                           "docker exec as root can only be stopped the same way.")
+        return False, "No run is in progress"
+    return True, "Stopping"
+
+
+def config_info():
+    """The settings this container runs with, for the web UI's Settings panel."""
+    schedule = schedule_info()
+    timeout = os.environ.get("IPSW_RUN_TIMEOUT", "12h")
+    return {
+        "version": os.environ.get("IPSW_MANAGER_VERSION", "dev"),
+        "download_dir": DOWNLOAD_DIR,
+        "check_interval": schedule["interval"],
+        "cron": schedule["cron"],
+        "tz": schedule["tz"],
+        "reverify_days": REVERIFY_DAYS,
+        "retry_minutes": os.environ.get("IPSW_RETRY_MINUTES", "60"),
+        "run_timeout": None if timeout == "0" else timeout,
+        "checksum": os.environ.get("IPSW_CHECKSUM_ALGO", "sha256"),
+        "user": f"{os.getuid()}:{os.getgid()}",
+        "port": PORT,
+        "download_links": DOWNLOAD_LINKS,
+    }
 
 
 _device_cache = {"at": 0.0, "devices": []}
@@ -821,7 +991,7 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <title>IPSW Manager</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='3' y='1' width='10' height='14' rx='2.5' fill='%233fb950'/%3E%3C/svg%3E">
+<link rel="icon" id="favicon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='3' y='1' width='10' height='14' rx='2.5' fill='%233fb950'/%3E%3C/svg%3E">
 <style>
 :root{
   --bg:#0d1117;--surface:#161b22;--surface-2:#0d1117;--border:#30363d;--border-soft:#21262d;
@@ -942,7 +1112,51 @@ tr.missing td:first-child{color:var(--text);font-weight:500;padding-left:30px}
 .cal-err{padding:10px 18px;font-size:12px;color:var(--orange);border-bottom:1px solid var(--border-soft)}
 .cal-list td:first-child{color:var(--muted);white-space:nowrap}
 .cal-list .ev{display:inline-block;vertical-align:middle;margin-right:6px}
+.btn-red{background:transparent;color:var(--red);border-color:var(--red)}
+.btn-red:hover:not(:disabled){background:var(--red-bg)}
+#btn-notify[aria-pressed="true"]{border-color:var(--blue)}
+.summary{padding:10px 18px;display:flex;flex-wrap:wrap;gap:6px;border-bottom:1px solid var(--border-soft)}
+.chip{font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;white-space:nowrap}
+.chip-ok{background:var(--green-bg);color:var(--green)}
+.chip-warn{background:var(--orange-bg);color:var(--orange)}
+.chip-err{background:var(--red-bg);color:var(--red)}
+.chip-info{background:var(--blue-bg);color:var(--blue)}
+.chip-muted{background:var(--gray-bg);color:var(--muted)}
+.dl{color:var(--blue);text-decoration:none;margin-left:8px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px;line-height:1;border-radius:4px;padding:0 3px}
+.dl:hover{background:var(--blue-bg)}
+.dl:focus-visible{outline:2px solid var(--blue);outline-offset:1px}
+.detail a{color:var(--blue)}
+a.btn-gray{display:inline-block;text-decoration:none;font-weight:500;border:1px solid var(--border);border-radius:6px;white-space:nowrap}
+.log-tools{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.seg button{border:0;border-radius:0;background:var(--btn-gray);color:var(--muted);font-size:12px;padding:4px 10px}
+.seg button+button{border-left:1px solid var(--border)}
+.seg button[aria-pressed="true"]{background:var(--btn-gray-hover);color:var(--text)}
+.out-ok{color:var(--green)}
+.out-warn{color:var(--orange)}
+.out-err{color:var(--red)}
+.out-info{color:var(--text)}
+.hist td{vertical-align:top}
+.hist td:first-child{white-space:nowrap;width:1%}
+.hist .outcome{overflow-wrap:anywhere}
+.hist .sub{max-width:none;white-space:normal}
+.tag{font-size:10px;font-weight:600;padding:1px 6px;border-radius:10px;white-space:nowrap;margin-left:6px;vertical-align:1px}
+.tag-stored{background:var(--green-bg);color:var(--green)}
+.tag-unsigned{background:var(--gray-bg);color:var(--muted)}
+.dev-grid label.unsigned>span:first-of-type{color:var(--muted)}
+details.card>summary{list-style:none;cursor:pointer}
+details.card>summary::-webkit-details-marker{display:none}
+details.card>summary .chev{display:inline-block;color:var(--faint);transition:transform .15s;margin-right:8px}
+details.card[open]>summary .chev{transform:rotate(90deg)}
+details.card:not([open])>summary{border-bottom:none}
+.settings dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;padding:14px 18px;font-size:13px}
+.settings dt{color:var(--muted)}
+.settings dd{min-width:0;overflow-wrap:anywhere}
+.settings .note{padding:0 18px 14px;font-size:12px;color:var(--muted)}
 @media (max-width:640px){
+  .summary,.settings dl,.settings .note{padding-left:14px;padding-right:14px}
+  .settings dl{grid-template-columns:1fr;gap:0}
+  .settings dd{margin-bottom:8px}
   header{padding:10px 16px}
   main{padding:16px;gap:16px}
   .hide-sm,.col-opt,.col-size{display:none}
@@ -976,6 +1190,8 @@ tr.missing td:first-child{color:var(--text);font-weight:500;padding-left:30px}
   <div class="hdr-actions">
     <button id="btn-run" class="btn-green" onclick="doRun(false)" title="Download new firmware, check files that are due a check, and delete IPSWs that are no longer needed">&#9654; Run Now</button>
     <button id="btn-verify" class="btn-gray" onclick="doRun(true)" title="Run Now, and also read every stored file back and check it, however recently it was checked">&#8635; Re-verify</button>
+    <button id="btn-stop" class="btn-red" onclick="doStop()" hidden title="Stop the run in progress">&#9632; Stop</button>
+    <button id="btn-notify" class="btn-gray" onclick="toggleNotify()" aria-pressed="false" hidden>&#128277;</button>
   </div>
 </header>
 <main>
@@ -984,6 +1200,7 @@ tr.missing td:first-child{color:var(--text);font-weight:500;padding-left:30px}
       <h2 class="card-title" id="files-title">Downloaded Firmware</h2>
       <span class="card-meta" id="disk"></span>
     </div>
+    <div id="summary" class="summary" aria-live="polite" hidden></div>
     <div id="folder-err" class="banner sev-err" role="alert" hidden></div>
     <div id="last-run" class="banner" hidden></div>
     <div class="table-wrap">
@@ -1040,18 +1257,48 @@ tr.missing td:first-child{color:var(--text);font-weight:500;padding-left:30px}
       <input id="dev-filter" type="search" placeholder="Filter, e.g. 15 Pro or iPhone8" aria-label="Filter phones" oninput="renderDevices()">
       <button id="btn-all" class="btn-gray" onclick="setVisible(true)">Select all</button>
       <button id="btn-none" class="btn-gray" onclick="setVisible(false)">Select none</button>
+      <button class="btn-gray" onclick="resetDefault()" title="Tick iPhone 11 and newer: what's downloaded until a selection is saved">Reset to default</button>
       <button id="btn-save" class="btn-green" onclick="saveDevices()" disabled>Save</button>
     </div>
     <div class="dev-note" id="dev-note">Unticked phones' firmware is deleted on the next run. Phones Apple no longer signs firmware for are skipped.</div>
     <div class="dev-grid" id="dev-grid"><div class="empty">Loading…</div></div>
   </section>
+  <section class="card" aria-labelledby="hist-title">
+    <div class="card-hdr">
+      <h2 class="card-title" id="hist-title">Run History</h2>
+      <span class="card-meta" id="hist-meta"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="hist">
+        <thead><tr><th>Started</th><th>Outcome</th></tr></thead>
+        <tbody id="hist-body"><tr><td colspan="2" class="empty">Loading…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="card-foot" id="hist-foot" hidden><button class="btn-gray btn-sm" id="hist-more" onclick="toggleHistory()">Show all</button></div>
+  </section>
   <section class="card" aria-labelledby="log-title">
     <div class="card-hdr">
       <h2 class="card-title" id="log-title">Log</h2>
-      <button class="btn-gray btn-sm" onclick="scrollLog()">&#8595; End</button>
+      <div class="log-tools">
+        <div class="seg" id="log-filter" role="group" aria-label="Show in the log">
+          <button data-filter="all" aria-pressed="true">All</button>
+          <button data-filter="problems" aria-pressed="false">Problems</button>
+          <button data-filter="latest" aria-pressed="false">Latest run</button>
+        </div>
+        <a class="btn-gray btn-sm" href="/api/log" download="ipsw-manager.log" title="Download the whole log file">&#10515; Download</a>
+        <button class="btn-gray btn-sm" onclick="scrollLog()">&#8595; End</button>
+      </div>
     </div>
     <div id="log" class="log" tabindex="0" aria-label="Run log"></div>
   </section>
+  <details class="card settings" id="settings">
+    <summary class="card-hdr">
+      <h2 class="card-title"><span class="chev" aria-hidden="true">›</span>Settings</h2>
+      <span class="card-meta" id="cfg-version"></span>
+    </summary>
+    <dl id="cfg"></dl>
+    <p class="note">These come from the container's environment variables (see the README). To change one, change it and recreate the container.</p>
+  </details>
 </main>
 <script>
 const $ = id => document.getElementById(id);
@@ -1120,6 +1367,7 @@ function colorLine(line) {
 let lastStatus = null;
 let polling = false;
 let runPending = false;
+let stopping = false;
 let logKey = null;
 const expanded = new Set();
 
@@ -1139,6 +1387,7 @@ async function refresh() {
       if (d.error) throw new Error(d.error);
     } catch (e) {
       $("dot").className = "error";
+      renderFavicon(null);
       $("status-lbl").textContent = "Can't reach the server";
       $("poll-ts").textContent = "last try " + new Date().toLocaleTimeString() + ": " + e.message;
       $("next-check").textContent = "";
@@ -1147,12 +1396,20 @@ async function refresh() {
     lastStatus = d;
     $("poll-ts").textContent = "updated " + new Date().toLocaleTimeString();
     $("dot").className = d.running ? "running" : "";
-    $("status-lbl").textContent = !d.running ? "Idle" : d.reverifying ? "Re-verifying…" : "Running…";
+    stopping = stopping && d.running;
+    $("status-lbl").textContent = !d.running ? "Idle" : stopping ? "Stopping…" : d.reverifying ? "Re-verifying…" : "Running…";
     if (!runPending) setRunButtons(d.running);
+    $("btn-stop").hidden = !d.running;
+    $("btn-stop").disabled = stopping;
     renderSchedule(d);
     renderBanners(d);
+    renderSummary(d);
     renderFiles();
+    renderHistory(d);
     renderLog(d.logs);
+    noticeRunEnd(d);
+    renderFavicon(d);
+    syncDeviceTags();
   } finally {
     polling = false;
   }
@@ -1200,6 +1457,12 @@ function renderBanners(d) {
     : "";
 }
 
+// " · next in 27 days", from IPSW_REVERIFY_DAYS.
+function nextCheck(f) {
+  if (!f.next_check) return "";
+  return new Date(f.next_check) <= Date.now() ? " · due now" : " · next " + rel(f.next_check);
+}
+
 function statusCell(f) {
   if (f.status === "downloading") return '<span class="badge badge-blue">⬇ Downloading</span>';
   if (f.status === "verifying") {
@@ -1215,7 +1478,7 @@ function statusCell(f) {
   }
   if (f.verified) {
     return '<span class="badge badge-green" title="The copy in the download folder was read back and matched its checksum on '
-      + esc(fmt(f.checked)) + '">✓ Verified</span><span class="sub">' + esc(rel(f.checked)) + '</span>';
+      + esc(fmt(f.checked)) + '">✓ Verified</span><span class="sub">' + esc(rel(f.checked) + nextCheck(f)) + '</span>';
   }
   return '<span class="badge badge-orange" title="Not yet read back from the download folder and checked. The next run, or Re-verify, will do it.">? Not checked</span>'
     + '<span class="sub">next run</span>';
@@ -1231,8 +1494,15 @@ function progress(f) {
   return bar + '<span class="speed">' + esc(parts.join(" · ")) + '</span>';
 }
 
+const downloadHref = f => "/download/" + encodeURIComponent(f.name);
+const canDownload = f => !!(lastStatus && lastStatus.download_links && !f.partial);
+
 function sizeBlock(f) {
-  return esc(f.size_human) + (f.total_human ? " of " + esc(f.total_human) : "") + progress(f);
+  const link = canDownload(f)
+    ? '<a class="dl" href="' + downloadHref(f) + '" download title="Download this IPSW (' + esc(f.size_human) + ')"'
+      + ' aria-label="Download the IPSW for ' + esc(f.model || f.name) + '">⤓</a>'
+    : "";
+  return esc(f.size_human) + (f.total_human ? " of " + esc(f.total_human) : "") + link + progress(f);
 }
 
 function fileRow(f) {
@@ -1252,13 +1522,21 @@ function fileRow(f) {
 
 function fileDetail(f) {
   const rows = [
-    ["File", '<span class="mono">' + esc(f.name) + (f.status === "downloading" ? ".partial" : "") + '</span>'],
+    ["File", '<span class="mono">' + esc(f.name) + (f.partial ? ".partial" : "") + '</span>'],
     ["Phones", esc((f.model ? f.model + " · " : "") + (f.identifiers.join(", ") || "—"))],
     ["Modified", esc(fmt(f.mtime))],
     ["Verified", f.verified
       ? esc(fmt(f.checked) + ": read back from the download folder and matched its checksum")
-      : f.status === "downloading" ? "Checked once the download finishes" : "Never: not yet read back and checked"],
+      : f.partial ? "Checked once the download finishes" : "Never: not yet read back and checked"],
   ];
+  if (f.verified) {
+    rows.push(["Next check", f.next_check
+      ? esc(fmt(f.next_check) + " (" + rel(f.next_check) + "). A run reads it back again then.")
+      : "Only if it's downloaded again: IPSW_REVERIFY_DAYS is 0"]);
+  }
+  if (canDownload(f)) {
+    rows.push(["Download", '<a href="' + downloadHref(f) + '" download>' + esc(f.name) + '</a> (' + esc(f.size_human) + ')']);
+  }
   if (f.check_failed) {
     rows.push(["Check failed", esc(fmt(f.check_failed.at) + ": " + f.check_failed.reason + ". The next run tries again.")]);
   }
@@ -1332,18 +1610,46 @@ $("files-body").addEventListener("click", e => {
   if (again) again.focus();
 });
 
+let logFilter = "all";
+let logLines = [];
+// A run's first line (older versions only logged one for scheduled runs).
+const RUN_START_RE = /^(▶️?\s+Run started — |🆕 .* — starting a run\.)/;
+
+function filteredLog(lines) {
+  const body = l => l.replace(TS_RE, "");
+  if (logFilter === "problems") return lines.filter(l => ["err", "warn"].includes(severity(body(l))));
+  if (logFilter === "latest") {
+    for (let i = lines.length - 1; i >= 0; i--) if (RUN_START_RE.test(body(lines[i]))) return lines.slice(i);
+  }
+  return lines;
+}
+
 function renderLog(lines) {
-  const key = lines.join("\n");
+  logLines = lines;
+  const shown = filteredLog(lines);
+  const key = logFilter + "\n" + shown.join("\n");
   if (key === logKey) return;
   const el = $("log");
   // Don't wipe out text someone is selecting to copy; catch up on a later poll.
   const sel = window.getSelection();
   if (logKey !== null && sel && !sel.isCollapsed && el.contains(sel.anchorNode)) return;
   const atBottom = logKey === null || el.scrollHeight - el.scrollTop <= el.clientHeight + 50;
-  el.innerHTML = lines.map(colorLine).join("\n");
+  el.innerHTML = shown.length ? shown.map(colorLine).join("\n")
+    : '<span class="dim">' + (logFilter === "problems"
+      ? "No warnings or errors in the last " + lines.length + " lines. Download the log to see older ones."
+      : "Nothing in the log yet.") + '</span>';
   logKey = key;
   if (atBottom) el.scrollTop = el.scrollHeight;
 }
+
+$("log-filter").addEventListener("click", e => {
+  const btn = e.target.closest("button[data-filter]");
+  if (!btn) return;
+  logFilter = btn.dataset.filter;
+  document.querySelectorAll("#log-filter button").forEach(b => b.setAttribute("aria-pressed", String(b === btn)));
+  logKey = null;  // redraw, and scroll to the end
+  renderLog(logLines);
+});
 
 function scrollLog() {
   const el = $("log");
@@ -1380,9 +1686,221 @@ async function doRun(reverify) {
   refresh();
 }
 
+async function doStop() {
+  const retry = config && config.check_interval
+    ? "\n• The scheduled checks may start it again in about " + config.retry_minutes + " min."
+    : "";
+  if (!confirm("Stop the run in progress?\n\n"
+    + "• A download in progress is thrown away; the next run starts it again.\n"
+    + "• Files already downloaded and checked are kept. If the run hadn't reached its cleanup, no old IPSWs are deleted."
+    + retry)) return;
+  stopping = true;
+  $("btn-stop").disabled = true;
+  $("status-lbl").textContent = "Stopping…";
+  let d;
+  try {
+    const resp = await fetch("/api/stop", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+    d = await resp.json();
+  } catch (e) {
+    d = {success: false, message: "Request failed: " + e.message};
+  }
+  if (!d.success) {
+    stopping = false;
+    alert(d.message);
+  }
+  refresh();
+}
+
+/* ---------- Summary ---------- */
+
+function renderSummary(d) {
+  const el = $("summary");
+  const files = d.downloads, missing = (d.missing || []).length;
+  const c = {verified: 0, notChecked: 0, failed: 0, active: 0};
+  files.forEach(f => {
+    if (f.status === "downloading" || f.status === "verifying") c.active++;
+    else if (f.check_failed) c.failed++;
+    else if (f.verified) c.verified++;
+    else c.notChecked++;
+  });
+  const updates = files.filter(f => f.update).length;
+  const chips = [];
+  if (d.folder_error) {
+    // The banner says it; counts of an unlisted folder would mislead.
+  } else if (files.length && c.verified === files.length && !missing && !updates) {
+    chips.push(["ok", "✓ All " + c.verified + " verified and up to date"]);
+  } else {
+    if (c.verified) chips.push(["ok", c.verified + " verified"]);
+    if (c.active) chips.push(["info", c.active + " in progress"]);
+    if (c.notChecked) chips.push(["warn", c.notChecked + " not checked"]);
+    if (c.failed) chips.push(["warn", c.failed + (c.failed === 1 ? " check" : " checks") + " failed"]);
+    if (missing) chips.push(["muted", missing + " not downloaded"]);
+    if (updates) chips.push(["warn", updates + " with a newer iOS out"]);
+  }
+  el.hidden = !chips.length;
+  setHTML(el, chips.map(([k, t]) => '<span class="chip chip-' + k + '">' + esc(t) + '</span>').join(""));
+}
+
+/* ---------- Run history ---------- */
+
+let historyAll = false;
+const HISTORY_SHOWN = 8;
+const fmtShort = iso => new Date(iso).toLocaleString(undefined, {day: "numeric", month: "short", hour: "2-digit", minute: "2-digit"});
+
+function duration(from, to) {
+  const s = Math.max(0, (new Date(to) - new Date(from)) / 1000);
+  if (s < 60) return Math.round(s) + " s";
+  if (s < 3600) return Math.round(s / 60) + " min";
+  const m = Math.round((s % 3600) / 60);
+  return Math.floor(s / 3600) + " h" + (m ? " " + m + " min" : "");
+}
+
+function historyRow(r) {
+  const when = r.started || r.ended;
+  const meta = [];
+  if (r.running) meta.push("running for " + duration(r.started, new Date().toISOString()));
+  else if (r.started && r.ended) meta.push("took " + duration(r.started, r.ended));
+  if (r.reverify) meta.push("Re-verify");
+  const outcome = r.running ? "Running…"
+    : r.outcome || "❌ Didn't finish: it was killed, timed out, or the container stopped.";
+  const sev = r.running ? "info" : severity(outcome) || "info";
+  const trigger = r.trigger || (r.started ? "" : "How it started isn't in the log");
+  return '<tr><td><span title="' + esc(fmt(when)) + '">' + esc(fmtShort(when)) + '</span>'
+    + (meta.length ? '<span class="sub">' + esc(meta.join(" · ")) + '</span>' : "") + '</td>'
+    + '<td class="outcome"><span class="out-' + sev + '">' + esc(outcome) + '</span>'
+    + (trigger ? '<span class="sub">' + esc(trigger) + '</span>' : "") + '</td></tr>';
+}
+
+function renderHistory(d) {
+  const past = d.history || [];
+  const runs = (d.current_run ? [Object.assign({running: true}, d.current_run)] : []).concat(past);
+  let rows;
+  if (!runs.length) {
+    const msg = d.history_available ? "No runs in the log yet." : "Run history is unavailable while the download folder isn't responding.";
+    rows = [["empty", '<tr><td colspan="2" class="empty">' + esc(msg) + '</td></tr>']];
+  } else {
+    rows = (historyAll ? runs : runs.slice(0, HISTORY_SHOWN))
+      .map(r => [(r.running ? "running|" : "") + (r.started || "") + "|" + (r.ended || ""), historyRow(r)]);
+  }
+  patchRows($("hist-body"), rows);
+  $("hist-foot").hidden = runs.length <= HISTORY_SHOWN;
+  $("hist-more").textContent = historyAll ? "Show fewer" : "Show all " + runs.length;
+  const recent = past.slice(0, 10);
+  const bad = recent.filter(r => !r.outcome || ["err", "warn"].includes(severity(r.outcome))).length;
+  $("hist-meta").textContent = recent.length
+    ? (bad ? bad + " of the last " + recent.length + " didn't finish cleanly" : "Last " + recent.length + " finished cleanly")
+    : "";
+}
+
+function toggleHistory() {
+  historyAll = !historyAll;
+  if (lastStatus) renderHistory(lastStatus);
+}
+
+/* ---------- Notices: tab title, icon, notifications ---------- */
+
+const canNotify = "Notification" in window && window.isSecureContext;
+let notifyOn = false;
+try { notifyOn = canNotify && Notification.permission === "granted" && localStorage.getItem("ipsw-notify") === "1"; } catch (e) {}
+let prevLastRun;  // undefined until the first poll
+let titleNotice = "";
+
+const outcomeText = line => line.replace(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\s+/, "");
+
+function updateTitle() {
+  document.title = (titleNotice ? titleNotice + " · " : "") + "IPSW Manager";
+}
+
+// A new "last run" line means a run ended. If nobody's looking, say so in the
+// tab title and, if turned on, with a notification.
+function noticeRunEnd(d) {
+  if (prevLastRun !== undefined && d.last_run && d.last_run !== prevLastRun && document.hidden) {
+    const text = outcomeText(d.last_run), sev = severity(text);
+    titleNotice = (sev === "err" ? "✗" : sev === "warn" ? "⚠" : "✓") + " Run finished";
+    updateTitle();
+    if (notifyOn && Notification.permission === "granted") {
+      try { new Notification("IPSW Manager: run finished", {body: text, tag: "ipsw-manager-run"}); } catch (e) {}
+    }
+  }
+  prevLastRun = d.last_run;
+}
+
+const FAVICON_COLORS = {ok: "#3fb950", warn: "#d29922", err: "#f85149", info: "#58a6ff"};
+let faviconColor = null;
+
+function renderFavicon(d) {
+  let sev = "ok";
+  if (!d || d.folder_error) sev = "err";
+  else if (d.running) sev = "info";
+  else {
+    sev = d.last_run ? severity(outcomeText(d.last_run)) || "ok" : "ok";
+    if (sev === "ok" && d.downloads.some(f => f.check_failed)) sev = "warn";
+  }
+  const color = FAVICON_COLORS[sev] || FAVICON_COLORS.ok;
+  if (color === faviconColor) return;
+  faviconColor = color;
+  $("favicon").href = "data:image/svg+xml," + encodeURIComponent(
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='3' y='1' width='10' height='14' rx='2.5' fill='" + color + "'/></svg>");
+}
+
+function renderNotifyButton() {
+  const btn = $("btn-notify");
+  btn.hidden = !canNotify;  // browsers only allow notifications over HTTPS or on localhost
+  btn.setAttribute("aria-pressed", String(notifyOn));
+  btn.textContent = notifyOn ? "🔔" : "🔕";
+  btn.title = notifyOn
+    ? "Notifications on: you'll get one when a run finishes while this tab is in the background. Click to turn them off."
+    : "Get a notification when a run finishes while this tab is in the background";
+  btn.setAttribute("aria-label", notifyOn ? "Turn run notifications off" : "Turn run notifications on");
+}
+
+async function toggleNotify() {
+  if (!notifyOn && Notification.permission !== "granted") {
+    if (await Notification.requestPermission() !== "granted") {
+      alert("This browser is blocking notifications from this page. Allow them in its site settings, then try again.");
+      return;
+    }
+  }
+  notifyOn = !notifyOn;
+  try { localStorage.setItem("ipsw-notify", notifyOn ? "1" : "0"); } catch (e) {}
+  renderNotifyButton();
+}
+
+/* ---------- Settings ---------- */
+
+let config = null;
+
+async function loadConfig() {
+  try {
+    config = await (await fetch("/api/config")).json();
+  } catch (e) {
+    $("cfg").innerHTML = '<dt>Settings</dt><dd>' + esc("Couldn't load them: " + e.message) + '</dd>';
+    return;
+  }
+  const c = config;
+  $("cfg-version").textContent = "version " + c.version;
+  const rows = [
+    ["Version", c.version],
+    ["Download folder", c.download_dir],
+    ["New firmware", c.check_interval ? "Looked for every " + c.check_interval + " min (CHECK_INTERVAL)" : "Not looked for (CHECK_INTERVAL is off)"],
+    ["Fixed-time runs", c.cron ? c.cron + " (CRON_SCHEDULE)" : "None (CRON_SCHEDULE isn't set)"],
+    ["Time zone", c.tz + " (TZ)"],
+    ["Stored files", c.reverify_days ? "Read back and checked every " + c.reverify_days + " days (IPSW_REVERIFY_DAYS)" : "Checked only when downloaded (IPSW_REVERIFY_DAYS is 0)"],
+    ["After a run that fails", c.check_interval ? "Tried again after " + c.retry_minutes + " min (IPSW_RETRY_MINUTES)" : "Not retried until the next run"],
+    ["Run time limit", c.run_timeout ? c.run_timeout + " (IPSW_RUN_TIMEOUT)" : "None (IPSW_RUN_TIMEOUT is 0)"],
+    ["Checksum", c.checksum.toUpperCase() + " (IPSW_CHECKSUM_ALGO)"],
+    ["Runs as", "User and group " + c.user + " (PUID, PGID)"],
+    ["Download links", c.download_links ? "On (WEBUI_DOWNLOADS)" : "Off (WEBUI_DOWNLOADS=0)"],
+    ["Web UI port", c.port + " (WEBUI_PORT)"],
+  ];
+  $("cfg").innerHTML = rows.map(([k, v]) => '<dt>' + esc(k) + '</dt><dd>' + esc(v) + '</dd>').join("");
+}
+
 /* ---------- Phones ---------- */
 
 let allDevices = [];
+let defaultIds = [];
+let tagsKey = "";
 let selected = new Set();
 let savedSelection = "";   // what's saved; "" if nothing has been saved yet
 let baselineSelection = null;  // what the page loaded with or last saved, for the leave warning
@@ -1403,17 +1921,53 @@ function visibleDevices() {
   return q ? allDevices.filter(d => (d.name + " " + d.identifier).toLowerCase().includes(q)) : allDevices;
 }
 
+// Phones with a finished IPSW in the download folder.
+const storedIds = () => new Set(((lastStatus && lastStatus.downloads) || []).filter(f => !f.partial).flatMap(f => f.identifiers));
+const computeTagsKey = () => [...storedIds()].sort().join(",") + "|"
+  + allDevices.filter(d => d.signed === false).map(d => d.identifier).join(",");
+
 function renderDevices() {
   const list = visibleDevices();
   const filtered = filterText() !== "";
+  const stored = storedIds();
   $("btn-all").textContent = filtered ? "Select shown" : "Select all";
   $("btn-none").textContent = filtered ? "Clear shown" : "Select none";
   $("dev-grid").innerHTML = list.length ? list.map(d =>
-    '<label><input type="checkbox" data-id="' + esc(d.identifier) + '"'
-    + (selected.has(d.identifier) ? " checked" : "") + '>'
-    + '<span>' + esc(d.name) + '</span><span class="mono">' + esc(d.identifier) + '</span></label>'
+    '<label' + (d.signed === false ? ' class="unsigned" title="Apple signs no firmware for this phone now, so nothing is downloaded for it"' : "") + '>'
+    + '<input type="checkbox" data-id="' + esc(d.identifier) + '"' + (selected.has(d.identifier) ? " checked" : "") + '>'
+    + '<span>' + esc(d.name)
+    + (stored.has(d.identifier) ? '<span class="tag tag-stored" title="Has an IPSW in the download folder">stored</span>' : "")
+    + (d.signed === false ? '<span class="tag tag-unsigned">not signed</span>' : "")
+    + '</span><span class="mono">' + esc(d.identifier) + '</span></label>'
   ).join("") : '<div class="empty">No phones match</div>';
+  tagsKey = computeTagsKey();
   updateDeviceMeta();
+}
+
+// Redraw the list when a phone's tags change (a download finished, or ipsw.me answered).
+function syncDeviceTags() {
+  if (allDevices.length && computeTagsKey() !== tagsKey) renderDevices();
+}
+
+function resetDefault() {
+  selected = new Set(defaultIds);
+  renderDevices();
+}
+
+// ipsw.me is asked about every phone in the background; pick up its answers.
+let hintTries = 0;
+async function refreshDeviceHints() {
+  if (!allDevices.some(d => d.signed == null) || hintTries++ >= 8) return;
+  try {
+    const d = await (await fetch("/api/devices")).json();
+    if (d.error) return;
+    const signed = new Map(d.devices.map(x => [x.identifier, x.signed]));
+    allDevices.forEach(x => { if (signed.has(x.identifier)) x.signed = signed.get(x.identifier); });
+    syncDeviceTags();
+  } catch (e) {
+    // try again below
+  }
+  setTimeout(refreshDeviceHints, 8000);
 }
 
 $("dev-grid").addEventListener("change", e => {
@@ -1433,6 +1987,7 @@ async function loadDevices() {
     const d = await (await fetch("/api/devices")).json();
     if (d.error) throw new Error(d.error);
     allDevices = d.devices;
+    defaultIds = d.default || [];
     selected = new Set(d.selected);
     savedSelection = d.saved ? selectionKey() : "";
     baselineSelection = selectionKey();
@@ -1441,6 +1996,7 @@ async function loadDevices() {
         "No selection saved yet, so iPhone 11 and newer are downloaded by default. Unticked phones' firmware is deleted on the next run.";
     }
     renderDevices();
+    setTimeout(refreshDeviceHints, 8000);
   } catch (e) {
     $("dev-grid").innerHTML = '<div class="empty">' + esc(e.message) + '</div>';
   }
@@ -1449,7 +2005,7 @@ async function loadDevices() {
 // Stored firmware that no ticked phone needs: the next run deletes it.
 function filesToDelete() {
   return ((lastStatus && lastStatus.downloads) || []).filter(f =>
-    f.status !== "downloading" && f.identifiers.length && !f.identifiers.some(i => selected.has(i)));
+    !f.partial && f.identifiers.length && !f.identifiers.some(i => selected.has(i)));
 }
 
 async function saveDevices() {
@@ -1562,14 +2118,20 @@ async function loadCalendar() {
 }
 
 renderCalendar();  // the month shows straight away; releases fill in when they arrive
+renderNotifyButton();
+loadConfig();
 loadDevices();
 loadCalendar();
 refresh();
-// A tab in the background doesn't poll; it catches up when it's shown again.
-setInterval(() => { if (!document.hidden) refresh(); }, 5000);
+// A tab in the background polls every 30 s instead of 5: often enough to
+// notice a run ending, and it catches up as soon as it's shown again.
+let tick = 0;
+setInterval(() => { tick++; if (!document.hidden || tick % 6 === 0) refresh(); }, 5000);
 setInterval(() => { if (!document.hidden) loadCalendar(); }, 3600 * 1000);
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
+  titleNotice = "";
+  updateTitle();
   refresh();
   if (Date.now() - calLoadedAt > 3600 * 1000) loadCalendar();
 });
@@ -1598,6 +2160,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         try:
             self._handle_get()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the browser went away, e.g. a download was cancelled
         except Exception as exc:
             print(f"ERROR in GET {self.path}: {exc}", flush=True)
             try:
@@ -1605,9 +2169,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def do_HEAD(self):  # noqa: N802
+        # Download managers ask for a file's size before fetching it.
+        path = self._route()
+        try:
+            if path.startswith("/download/"):
+                self._send_ipsw(urllib.parse.unquote(path[len("/download/"):]), head=True)
+            else:
+                self.send_response(404 if path not in ("/", "/index.html") else 200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _handle_get(self):
         path = self._route()
-        if path in ("/", "/index.html"):
+        if path.startswith("/download/"):
+            self._send_ipsw(urllib.parse.unquote(path[len("/download/"):]))
+        elif path == "/api/log":
+            self._send_log()
+        elif path == "/api/config":
+            self.send_json(config_info())
+        elif path in ("/", "/index.html"):
             body = HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1629,10 +2212,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"error": f"Couldn't fetch device list from ipsw.me: {exc}"}, status=502)
                 return
             saved = _with_timeout(read_selection, fallback=None)
+            # Whether Apple signs anything for each phone, as far as ipsw.me
+            # has answered yet (None until it has); the rest arrive later.
+            firmware = signed_firmware([d["identifier"] for d in devices])
             self.send_json(
                 {
-                    "devices": devices,
+                    "devices": [
+                        dict(d, signed=(firmware[d["identifier"]]["latest"] is not None)
+                             if d["identifier"] in firmware else None)
+                        for d in devices
+                    ],
                     "selected": saved if saved is not None else default_selection(devices),
+                    "default": default_selection(devices),
                     "saved": saved is not None,
                 }
             )
@@ -1669,6 +2260,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         missing, unsigned = ([], []) if folder_error else missing_phones(files, selection, names, firmware)
 
         logs = _with_timeout(get_log_tail, 200, fallback=["[log unavailable — the download folder isn't responding]"])
+
+        history = _with_timeout(read_run_history, fallback=None)
+        runs, open_run = history if history else ([], None)
+        current = None
+        if open_run and running:
+            current = open_run
+        elif open_run:
+            runs = [open_run] + runs  # started but never ended: killed outright
         return {
             "running": running,
             "reverifying": run == "reverify",
@@ -1680,8 +2279,82 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "schedule": schedule_info(),
             "logs": logs,
             "last_run": get_last_run(logs, running),
+            "current_run": current,
+            "history": runs[:HISTORY_MAX],
+            "history_available": history is not None,
+            "download_links": DOWNLOAD_LINKS,
             "download_dir": DOWNLOAD_DIR,
         }
+
+    def _send_log(self):
+        """The whole log file, as a download."""
+        try:
+            f = open(LOG_FILE, "rb")
+        except OSError as exc:
+            self.send_json({"error": f"Couldn't open the log: {exc.strerror or exc}"}, status=404)
+            return
+        with f:
+            size = os.fstat(f.fileno()).st_size
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", 'attachment; filename="ipsw-manager.log"')
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.connection.sendfile(f, 0, size)
+
+    def _send_ipsw(self, name, head=False):
+        """A stored IPSW, with Range support so a cut-off download can resume."""
+        def not_found(message, status=404):
+            body = (message + "\n").encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if not head:
+                self.wfile.write(body)
+
+        if not DOWNLOAD_LINKS:
+            not_found("Download links are turned off (WEBUI_DOWNLOADS=0).", 403)
+            return
+        # Only a finished IPSW directly in the download folder: no paths,
+        # no hidden files, no .partial still being written or checked.
+        if name != os.path.basename(name) or name.startswith(".") or not name.endswith(".ipsw"):
+            not_found("No such firmware file.")
+            return
+        try:
+            f = open(os.path.join(DOWNLOAD_DIR, name), "rb")
+        except OSError:
+            not_found("No such firmware file.")
+            return
+        with f:
+            st = os.fstat(f.fileno())
+            size, start, end, status = st.st_size, 0, st.st_size - 1, 200
+            m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", "").strip())
+            if m and (m.group(1) or m.group(2)):
+                if m.group(1):
+                    start = int(m.group(1))
+                    end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+                else:  # the last N bytes
+                    start = max(0, size - int(m.group(2)))
+                if start > end or start >= size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                status = 206
+            self.send_response(status)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+            self.send_header("Last-Modified", email.utils.formatdate(st.st_mtime, usegmt=True))
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            if not head and size:
+                self.connection.sendfile(f, start, end - start + 1)
 
     def _same_origin(self):
         """False for a request another website made from the viewer's browser.
@@ -1711,7 +2384,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _handle_post(self):
         path = self._route()
-        if path not in ("/api/run", "/api/devices"):
+        if path not in ("/api/run", "/api/stop", "/api/devices"):
             self.send_response(404)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -1743,6 +2416,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/run":
             ok, msg = trigger_run(data.get("reverify") is True)
+            self.send_json({"success": ok, "message": msg})
+            return
+        if path == "/api/stop":
+            ok, msg = stop_run()
             self.send_json({"success": ok, "message": msg})
             return
 
