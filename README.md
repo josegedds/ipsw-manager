@@ -18,7 +18,7 @@ Docker image: [`josephgeddes/ipsw-manager`](https://hub.docker.com/r/josephgedde
 Open `http://<host>:8080` to:
 
 - see downloaded firmware and the run log
-- start a run (**Run Now**), or read every stored file back and check it now (**Re-verify**)
+- start a run (**Run Now**), or a run that also reads every stored file back and checks it, however recently it was checked (**Re-verify**)
 - choose which phones to download under **Phones to Download**
 - see the **Release Calendar**: public iOS releases (from ipsw.me), betas and release candidates (from Apple's developer releases feed), and which versions your phones can install now. Apple doesn't announce release dates, so once a release candidate is out the calendar shows the public release as expected about a week later. That date is an estimate.
 
@@ -37,13 +37,15 @@ After that:
 
 - Every run checks each stored file is still the size it was when verified.
 - Once a file's last check is `IPSW_REVERIFY_DAYS` old (30 by default), a run starts to read it back again. This catches a file that has gone bad on the NAS since.
-- **Re-verify** in the web UI, or `docker exec ipsw-manager ipsw-manager.sh --reverify`, reads every file back now.
-- A file that fails is deleted and downloaded again. A file that can't be read at all (the NAS is offline, say) is left alone and reported.
+- **Re-verify** in the web UI, or `docker exec ipsw-manager ipsw-manager.sh --reverify`, reads every file back now. It's a full run otherwise, the same as **Run Now**: it also downloads new firmware and deletes IPSWs that are no longer current or belong to phones you've unticked.
+- A file that fails is deleted and downloaded again. If that download fails too, the phone has no IPSW until a later run gets it; the checks try again after `IPSW_RETRY_MINUTES`.
+- A file that can't be read at all (the NAS is offline, say) is left alone and reported. It shows as **Check failed** in the web UI, and the next run tries to check it again.
+- If ipsw.me can't be reached, files are checked against the checksum saved when they last passed. One that's damaged is deleted, and a run once ipsw.me answers downloads it again if it's still current. A file with no saved checksum (it has never passed) waits for ipsw.me.
 - If ipsw.me publishes no checksum for a file, the file is tested as the ZIP archive an IPSW is: every member is read and its CRC checked.
 
 Reading back takes about as long as copying the file from the NAS: over gigabit Ethernet, roughly 10 seconds per GB, so a minute or two per IPSW. Checks of files already in the folder are done after any downloads, so new firmware isn't kept waiting.
 
-The web UI shows **Verified** only for files that have passed the read-back, with the date in the badge's tooltip. Results are kept in `.hash-cache/` in the download folder.
+The web UI shows **Verified** only for files that have passed the read-back, with the date in the badge's tooltip. Results are kept in `.hash-cache/` in the download folder. While a file is read back the web UI shows its progress, and says **second read** when the first came back wrong. The run's last line, shown as **Last run**, counts what it did, e.g. `Read back 4: 3 OK, 1 damaged. Replaced 1 damaged file(s).`
 
 **Upgrading.** Earlier versions only did the first check. The first run after upgrading reads every existing file back once (they show as **Not checked** until then) and replaces any that fail. Nothing is downloaded again unless it fails.
 
@@ -77,7 +79,7 @@ Or with Docker Compose: edit the volume path and settings in [`compose.yml`](com
 | --- | --- | --- |
 | `CHECK_INTERVAL` | `30` | Minutes between checks for new firmware, 1 to 60. `0` turns the checks off |
 | `CRON_SCHEDULE` | unset | Optional: also do a full run at fixed times (cron syntax, in `TZ`), e.g. `0 18 * * *` |
-| `IPSW_RETRY_MINUTES` | `60` | After a run that didn't finish cleanly, minutes the checks wait (from when it ended) before trying the same firmware again |
+| `IPSW_RETRY_MINUTES` | `60` | After a run that didn't finish cleanly, minutes the checks wait (from when it ended) before trying again |
 | `TZ` | `UTC` | Time zone for `CRON_SCHEDULE`, e.g. `Europe/London` |
 | `PUID` / `PGID` | unset (root) | User and group to run as, so files on the NAS aren't owned by root. `PGID` defaults to `PUID` |
 | `IPSW_DOWNLOAD_DIR` | `/downloads` | Where IPSWs, the log and the selection are stored |
@@ -88,7 +90,7 @@ Or with Docker Compose: edit the volume path and settings in [`compose.yml`](com
 | `IPSW_RUN_TIMEOUT` | `12h` | Stop a run that takes longer than this (`timeout` syntax, e.g. `90m`). `0` turns it off |
 | `WEBUI_PORT` | `8080` | Web UI port |
 
-**When runs happen.** Apple doesn't notify anyone of a release, so "run when a new iOS version is out" means asking often. A check is one small request to ipsw.me per selected phone and doesn't touch the NAS beyond reading the phone selection. A new version is picked up within `CHECK_INTERVAL` minutes of ipsw.me listing it. The first check after the container starts always does a run. A run also starts when stored files are due to be read back and checked again (`IPSW_REVERIFY_DAYS`). A check never notices files deleted from the download folder by hand; use **Run Now** for that, or set `CRON_SCHEDULE` for a regular full run as well. To go back to runs at fixed times only, set `CHECK_INTERVAL=0` and `CRON_SCHEDULE`.
+**When runs happen.** Apple doesn't notify anyone of a release, so "run when a new iOS version is out" means asking often. A check is one small request to ipsw.me per selected phone and doesn't touch the NAS beyond reading the phone selection. A new version is picked up within `CHECK_INTERVAL` minutes of ipsw.me listing it. The first check after the container starts always does a run. A run also starts when stored files are due to be read back and checked again (`IPSW_REVERIFY_DAYS`), and when the last run didn't finish cleanly (see below). A check never notices files deleted from the download folder by hand; use **Run Now** for that, or set `CRON_SCHEDULE` for a regular full run as well. To go back to runs at fixed times only, set `CHECK_INTERVAL=0` and `CRON_SCHEDULE`.
 
 Both are run by [supercronic](https://github.com/aptible/supercronic). The log's timestamps are always in UTC.
 
@@ -102,9 +104,9 @@ sudo chown -R 1000:1000 /path/to/ipsw
 
 **Access.** The web UI has no login, and anyone who can reach it can start runs and change the phone list. To make it reachable only from the host itself, publish the port on localhost: `-p 127.0.0.1:8080:8080`.
 
-**If ipsw.me is unreachable.** Lookups are retried. If any phone's lookup still fails, that run downloads what it can but skips the cleanup, so that phone's IPSW isn't deleted.
+**If ipsw.me is unreachable.** Lookups are retried. If any phone's lookup still fails, that run downloads what it can but skips the cleanup, so that phone's IPSW isn't deleted. Files that are due a check (or all of them, with **Re-verify**) are checked against their saved checksums. The checks start a run again once ipsw.me answers for every phone.
 
-**If a download fails.** The run carries on with the other phones but skips the cleanup, so a phone whose new firmware didn't download keeps its current IPSW. The same goes for a download that fails its check, and for a stored file that can't be read back. A download that stalls (under 1 KB/s for two minutes) is abandoned. The checks try again an hour later (`IPSW_RETRY_MINUTES`), or sooner if the firmware changes again, and so does **Run Now** or a `CRON_SCHEDULE` run.
+**If a download fails.** The run carries on with the other phones but skips the cleanup, so a phone whose new firmware didn't download keeps its current IPSW. The same goes for a download that fails its check, and for a stored file that can't be read back. A download that stalls (under 1 KB/s for two minutes) is abandoned. After any run that doesn't finish cleanly, the checks try again an hour later (`IPSW_RETRY_MINUTES`), or sooner if the firmware changes again, and so does **Run Now** or a `CRON_SCHEDULE` run.
 
 **If the NAS goes offline.** A run that can't write to the download folder stops without deleting anything. A run that hangs on it is stopped after `IPSW_RUN_TIMEOUT`, so later runs aren't blocked behind it. Either way the web UI's **Last run** says what happened, even while the NAS is unreachable, and so does `docker logs`.
 
