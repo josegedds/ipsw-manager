@@ -32,13 +32,13 @@ Open `http://<host>:8080` to:
 
 The selection is saved to `selected-devices.json` in the download folder. Until you save one, iPhone 11 and newer are downloaded. If saving would leave stored firmware without a ticked phone, the web UI lists those files and asks first, since the next run deletes them.
 
-Click a phone in the firmware table for its file name, when it was last verified and will next be checked, and why a check failed. The page follows your system's light or dark setting and works on a phone. It shows log times in your browser's time zone.
+The firmware table shows each phone's model, iOS version and status. Click a phone for the rest: its file name, identifiers, size, when it was last verified and will next be checked, why a check failed, and a download button. The page follows your system's light or dark setting and works on a phone. It shows log times in your browser's time zone.
 
 When a run finishes while the tab is in the background, the tab's title says so, and its icon turns green, orange or red to match the outcome. With the 🔔 button the browser shows a notification as well. Browsers only allow notifications on pages served over HTTPS or from `localhost`, so the button appears only there: behind an HTTPS reverse proxy, say.
 
 ### Download links
 
-Each stored IPSW has a ⤓ link in the firmware table. Downloads can be resumed if they're cut off. A file that's still downloading or being checked has no link. Anyone who can reach the web UI can use the links; the files are Apple's public firmware, so the cost is bandwidth. Set `WEBUI_DOWNLOADS=0` to turn them off.
+Click a phone in the firmware table and use **Download IPSW**. Downloads can be resumed if they're cut off. A file that's still downloading or being checked has no link. Anyone who can reach the web UI can use the links; the files are Apple's public firmware, so the cost is bandwidth. Set `WEBUI_DOWNLOADS=0` to turn them off.
 
 ## Verification
 

@@ -1013,7 +1013,6 @@ HTML = r"""<!DOCTYPE html>
 }
 *{box-sizing:border-box;margin:0;padding:0}
 [hidden]{display:none!important}
-.only-sm,.sub.only-sm{display:none}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
 header{background:var(--surface);border-bottom:1px solid var(--border);padding:12px 24px;display:flex;align-items:center;flex-wrap:wrap;gap:8px 16px;position:sticky;top:0;z-index:10}
 .hdr-left{display:flex;align-items:center;flex-wrap:wrap;gap:4px 10px;min-width:0}
@@ -1053,8 +1052,9 @@ tbody tr:last-child td{border-bottom:none}
 tbody tr:hover td{background:var(--hover)}
 .muted{color:var(--muted)}
 .mono{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:12px}
-.sub{display:block;font-size:11px;color:var(--muted);margin-top:3px;max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sub{display:block;font-size:11px;color:var(--muted);margin-top:3px;max-width:340px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sub.warn{color:var(--orange)}
+.ios,.ios .sub{white-space:nowrap}
 .row-toggle{all:unset;cursor:pointer;font-weight:500;display:inline-flex;align-items:baseline;gap:6px;border-radius:4px}
 .row-toggle:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
 .row-toggle .chev{display:inline-block;color:var(--faint);transition:transform .15s;width:8px}
@@ -1063,7 +1063,7 @@ tr.detail td{background:var(--surface-2);padding:10px 16px 12px 34px}
 tr.detail:hover td{background:var(--surface-2)}
 .detail dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;font-size:12px}
 .detail dt{color:var(--muted)}
-.detail dd{min-width:0;overflow-wrap:anywhere}
+.detail dd{min-width:0;overflow-wrap:break-word}
 tr.missing td{color:var(--muted)}
 tr.missing td:first-child{color:var(--text);font-weight:500;padding-left:30px}
 .speed{display:block;color:var(--blue);font-size:11px;margin-top:2px}
@@ -1122,10 +1122,8 @@ tr.missing td:first-child{color:var(--text);font-weight:500;padding-left:30px}
 .chip-err{background:var(--red-bg);color:var(--red)}
 .chip-info{background:var(--blue-bg);color:var(--blue)}
 .chip-muted{background:var(--gray-bg);color:var(--muted)}
-.dl{color:var(--blue);text-decoration:none;margin-left:8px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px;line-height:1;border-radius:4px;padding:0 3px}
-.dl:hover{background:var(--blue-bg)}
-.dl:focus-visible{outline:2px solid var(--blue);outline-offset:1px}
-.detail a{color:var(--blue)}
+.dl-btn{margin-top:10px;color:var(--text)}
+.dl-btn:hover{background:var(--btn-gray-hover)}
 a.btn-gray{display:inline-block;text-decoration:none;font-weight:500;border:1px solid var(--border);border-radius:6px;white-space:nowrap}
 .log-tools{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden}
@@ -1159,14 +1157,13 @@ details.card:not([open])>summary{border-bottom:none}
   .settings dd{margin-bottom:8px}
   header{padding:10px 16px}
   main{padding:16px;gap:16px}
-  .hide-sm,.col-opt,.col-size{display:none}
-  .only-sm,.sub.only-sm{display:block}
+  .hide-sm{display:none}
   th,td{padding:9px 7px}
   th:first-child,td:first-child{padding-left:12px}
   .badge{padding:3px 7px}
   tr.detail td{padding:10px 10px 12px 26px}
   tr.missing td:first-child{padding-left:26px}
-  .sub{max-width:130px;white-space:normal}
+  .sub{max-width:180px;white-space:normal}
   .bar{width:90px}
   .card-hdr,.banner,.dev-tools,.cal-foot,.cal-err,.card-foot{padding-left:14px;padding-right:14px}
   .cal-day{min-height:54px;padding:3px}
@@ -1208,15 +1205,12 @@ details.card:not([open])>summary{border-bottom:none}
         <thead>
           <tr>
             <th>Model</th>
-            <th class="col-opt">Identifier</th>
             <th>iOS</th>
-            <th class="col-size">Size</th>
-            <th class="col-opt">Modified</th>
             <th>Status</th>
           </tr>
         </thead>
         <tbody id="files-body">
-          <tr><td colspan="6" class="empty">Loading…</td></tr>
+          <tr><td colspan="3" class="empty">Loading…</td></tr>
         </tbody>
       </table>
     </div>
@@ -1468,12 +1462,12 @@ function nextCheck(f) {
 }
 
 function statusCell(f) {
-  if (f.status === "downloading") return '<span class="badge badge-blue">⬇ Downloading</span>';
+  if (f.status === "downloading") return '<span class="badge badge-blue">⬇ Downloading</span>' + progress(f);
   if (f.status === "verifying") {
     return '<span class="badge badge-blue" title="' + (f.read_pass > 1
         ? "The first read didn't match its checksum. Reading it again to tell a damaged file from a bad read."
         : "Reading the stored file back and checking it against its checksum") + '">🔍 Verifying</span>'
-      + '<span class="sub">' + (f.read_pass > 1 ? "second read" : "reading back") + '</span>';
+      + progress(f, f.read_pass > 1 ? "second read" : "reading back");
   }
   if (f.check_failed) {
     return '<span class="badge badge-orange" title="' + esc("Couldn't be read back to check it on " + fmt(f.check_failed.at) + ": "
@@ -1488,9 +1482,9 @@ function statusCell(f) {
     + '<span class="sub">next run</span>';
 }
 
-function progress(f) {
-  if (f.status !== "downloading" && f.status !== "verifying") return "";
-  const parts = [];
+// Bar and "38% · 12.4 MB/s · 6 min left", under a Downloading or Verifying badge.
+function progress(f, label) {
+  const parts = label ? [label] : [];
   if (f.percent != null) parts.push(Math.floor(f.percent) + "%");
   parts.push(f.speed_human || "measuring…");
   if (f.eta_human) parts.push(f.eta_human);
@@ -1501,34 +1495,24 @@ function progress(f) {
 const downloadHref = f => "/download/" + encodeURIComponent(f.name);
 const canDownload = f => !!(lastStatus && lastStatus.download_links && !f.partial);
 
-function sizeBlock(f) {
-  const link = canDownload(f)
-    ? '<a class="dl" href="' + downloadHref(f) + '" download title="Download this IPSW (' + esc(f.size_human) + ')"'
-      + ' aria-label="Download the IPSW for ' + esc(f.model || f.name) + '">⤓</a>'
-    : "";
-  return esc(f.size_human) + (f.total_human ? " of " + esc(f.total_human) : "") + link + progress(f);
-}
-
 function fileRow(f) {
   const open = expanded.has(f.name);
   const ios = f.version !== "—" ? "iOS " + esc(f.version) : "—";
   return '<tr>'
     + '<td><button type="button" class="row-toggle" data-name="' + esc(f.name) + '" aria-expanded="' + open + '">'
-    + '<span class="chev" aria-hidden="true">›</span>' + esc(f.model || f.identifiers.join(", ") || f.name) + '</button>'
-    + '<div class="only-sm sub mono">' + sizeBlock(f) + '</div></td>'
-    + '<td class="mono col-opt">' + esc(f.identifiers.join(", ") || "—") + '</td>'
-    + '<td>' + ios + (f.update ? '<span class="sub warn" title="Apple now signs iOS ' + esc(f.update)
+    + '<span class="chev" aria-hidden="true">›</span>' + esc(f.model || f.identifiers.join(", ") || f.name) + '</button></td>'
+    + '<td class="ios">' + ios + (f.update ? '<span class="sub warn" title="Apple now signs iOS ' + esc(f.update)
       + ' for this phone. The next run downloads it, then deletes this file.">' + esc(f.update) + ' is out</span>' : "") + '</td>'
-    + '<td class="mono col-size">' + sizeBlock(f) + '</td>'
-    + '<td class="muted col-opt" title="' + esc(fmt(f.mtime)) + '">' + esc(fmtDate(f.mtime)) + '</td>'
     + '<td>' + statusCell(f) + '</td></tr>';
 }
 
 function fileDetail(f) {
   const rows = [
-    ["File", '<span class="mono">' + esc(f.name) + (f.partial ? ".partial" : "") + '</span>'],
+    // Long names break only after an underscore on narrow screens.
+    ["File", '<span class="mono">' + esc(f.name + (f.partial ? ".partial" : "")).replace(/_/g, "_<wbr>") + '</span>'],
     ["Phones", esc((f.model ? f.model + " · " : "") + (f.identifiers.join(", ") || "—"))],
-    ["Modified", esc(fmt(f.mtime))],
+    ["Size", esc(f.size_human + (f.total_human ? " of " + f.total_human : ""))],
+    ["Modified", f.mtime ? esc(fmt(f.mtime)) : "Still downloading"],
     ["Verified", f.verified
       ? esc(fmt(f.checked) + ": read back from the download folder and matched its checksum")
       : f.partial ? "Checked once the download finishes" : "Never: not yet read back and checked"],
@@ -1538,27 +1522,25 @@ function fileDetail(f) {
       ? esc(fmt(f.next_check) + " (" + rel(f.next_check) + "). A run reads it back again then.")
       : "Only if it's downloaded again: IPSW_REVERIFY_DAYS is 0"]);
   }
-  if (canDownload(f)) {
-    rows.push(["Download", '<a href="' + downloadHref(f) + '" download>' + esc(f.name) + '</a> (' + esc(f.size_human) + ')']);
-  }
   if (f.check_failed) {
     rows.push(["Check failed", esc(fmt(f.check_failed.at) + ": " + f.check_failed.reason + ". The next run tries again.")]);
   }
   if (f.update) {
     rows.push(["Newer iOS", esc("Apple now signs iOS " + f.update + " for this phone. The next run downloads it, then deletes this file.")]);
   }
-  return '<tr class="detail"><td colspan="6"><dl>'
-    + rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join("") + '</dl></td></tr>';
+  const download = canDownload(f)
+    ? '<a class="btn-gray btn-sm dl-btn" href="' + downloadHref(f) + '" download>⤓ Download IPSW (' + esc(f.size_human) + ')</a>'
+    : "";
+  return '<tr class="detail"><td colspan="3"><dl>'
+    + rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join("") + '</dl>' + download + '</td></tr>';
 }
 
 function missingRow(m, running) {
   const tip = m.checked
     ? "Selected, but there's no IPSW for it in the download folder. " + (running ? "This run" : "The next run") + " downloads iOS " + m.latest + "."
     : "Selected, but there's no IPSW for it in the download folder. Asking ipsw.me what Apple signs for it…";
-  return '<tr class="missing"><td>' + esc(m.model) + '</td>'
-    + '<td class="mono col-opt">' + esc(m.identifier) + '</td>'
-    + '<td>' + (m.latest ? "iOS " + esc(m.latest) : "—") + '</td>'
-    + '<td class="col-size">—</td><td class="col-opt">—</td>'
+  return '<tr class="missing"><td title="' + esc(m.identifier) + '">' + esc(m.model) + '</td>'
+    + '<td class="ios">' + (m.latest ? "iOS " + esc(m.latest) : "—") + '</td>'
     + '<td><span class="badge badge-gray" title="' + esc(tip) + '">○ Not downloaded</span>'
     + '<span class="sub">' + (!m.checked ? "checking ipsw.me…" : running ? "this run" : "next run") + '</span></td></tr>';
 }
@@ -1592,7 +1574,7 @@ function renderFiles() {
   (d.missing || []).forEach(m => rows.push(["missing:" + m.identifier, missingRow(m, d.running)]));
   if (!rows.length) {
     const msg = d.folder_error ? "Can't list the download folder right now." : "No IPSW files in " + d.download_dir + " yet.";
-    rows.push(["empty", '<tr><td colspan="6" class="empty">' + esc(msg) + '</td></tr>']);
+    rows.push(["empty", '<tr><td colspan="3" class="empty">' + esc(msg) + '</td></tr>']);
   }
   patchRows($("files-body"), rows);
 
