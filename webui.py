@@ -1087,8 +1087,6 @@ tr.missing td:first-child{color:var(--text);font-weight:500;padding-left:30px}
 .dev-tools input{flex:1;min-width:160px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:6px 10px;font-size:13px;font-family:inherit}
 .dev-tools button{font-size:12px;padding:5px 11px}
 .dev-note{padding:10px 18px 0;font-size:12px;color:var(--muted)}
-.dev-selected{padding:8px 18px 0;font-size:12px;color:var(--muted);line-height:1.5}
-.dev-selected b{color:var(--text);font-weight:600}
 .dev-grid{padding:4px 18px 14px;max-height:560px;overflow-y:auto}
 .dev-grid input{accent-color:var(--btn-green);margin:0;flex-shrink:0}
 .fam{display:grid;grid-template-columns:200px 1fr;gap:6px 14px;align-items:start;padding:10px 0;border-bottom:1px solid var(--border-soft)}
@@ -1162,7 +1160,7 @@ details.card:not([open])>summary{border-bottom:none}
 .settings dd{min-width:0;overflow-wrap:anywhere}
 .settings .note{padding:0 18px 14px;font-size:12px;color:var(--muted)}
 @media (max-width:640px){
-  .summary,.settings dl,.settings .note,.dev-grid,.dev-selected{padding-left:14px;padding-right:14px}
+  .summary,.settings dl,.settings .note,.dev-grid{padding-left:14px;padding-right:14px}
   .fam{grid-template-columns:1fr}
   .dev-grid{max-height:none}  /* one scroll, the page's, on a touch screen */
   .settings dl{grid-template-columns:1fr;gap:0}
@@ -1267,7 +1265,6 @@ details.card:not([open])>summary{border-bottom:none}
       <button id="btn-save" class="btn-green" onclick="saveDevices()" disabled>Save</button>
     </div>
     <div class="dev-note" id="dev-note">Unticked phones' firmware is deleted on the next run. Phones Apple no longer signs firmware for are skipped.</div>
-    <div class="dev-selected" id="dev-selected" aria-live="polite"></div>
     <div class="dev-grid" id="dev-grid"><div class="empty">Loading…</div></div>
   </section>
   <section class="card" aria-labelledby="hist-title">
@@ -1911,17 +1908,6 @@ const selectionKey = () => [...selected].sort().join(",");
 function updateDeviceMeta() {
   const chosen = models.filter(m => modelState(m) !== "none");
   $("dev-count").textContent = chosen.length + " of " + models.length + " selected";
-  // A whole family reads as "iPhone 16 (all)", so a long selection stays short.
-  const parts = groupModels(models).flatMap(g => {
-    const picked = g.models.filter(m => modelState(m) !== "none");
-    if (g.models.length > 1 && picked.length === g.models.length && picked.every(m => modelState(m) === "all")) {
-      return [g.name + " (all)"];
-    }
-    return picked.map(m => m.name + (modelState(m) === "some" ? " (some versions)" : ""));
-  });
-  $("dev-selected").innerHTML = parts.length
-    ? "<b>Selected:</b> " + parts.map(esc).join(", ")
-    : "<b>Nothing selected.</b> Tick at least one phone to save.";
   const dirty = selectionKey() !== savedSelection;
   $("btn-save").disabled = !dirty || selected.size === 0;
   $("btn-save").textContent = dirty ? "Save" : "Saved";
