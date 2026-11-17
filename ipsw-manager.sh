@@ -287,7 +287,7 @@ check_download_dir() {
       :  # Set up before the marker existed — adopt it.
     elif [[ -e "$SEEN_MARKER_FILE" ]]; then
       # Empty, but this container has used a marked folder before.
-      RESULT="❌ ${DOWNLOAD_DIR} is empty and missing its .ipsw-manager marker — is the NAS mounted? Nothing was changed."
+      RESULT="❌ ${DOWNLOAD_DIR} is empty and missing its .ipsw-manager marker — is the drive or network share it's on connected? Nothing was changed."
       printf "%s  %s\n" "$(timestamp)" "$RESULT" >&2
       echo "   If this really is a new, empty folder, create the marker and run again:" >&2
       echo "   touch ${MARKER_FILE}" >&2
@@ -521,7 +521,7 @@ checked_how() {
 # One read came back wrong and the next one right: the file is fine, the
 # path to it isn't.
 warn_reread() {
-  note "⚠️  [$1]: The first read of $2 came back wrong and the second was right — reads from the download folder are unreliable. Check the network connection to the NAS."
+  note "⚠️  [$1]: The first read of $2 came back wrong and the second was right — reads from the download folder are unreliable. Check the drive or network share it's on, and its connection."
 }
 
 # The redrawn progress bar is only for someone watching a terminal
@@ -737,7 +737,7 @@ download_unique() {
     reread-ok) warn_reread "$LABEL" "$FILE_NAME" ;;
     mismatch)
       if [[ -n "$HASH_CMD" ]]; then
-        download_failed "$LABEL" "$VERSION" "The download arrived intact but the copy saved to the download folder is damaged ($HASH_ALGO read back as $V_HASH) — check the network connection to the NAS and its disks. File removed, will retry next run"
+        download_failed "$LABEL" "$VERSION" "The download arrived intact but the copy saved to the download folder is damaged ($HASH_ALGO read back as $V_HASH) — check the drive or network share it's saved to, and its connection. File removed, will retry next run"
       else
         download_failed "$LABEL" "$VERSION" "The saved file is damaged: $V_INFO — file removed, will retry next run"
       fi

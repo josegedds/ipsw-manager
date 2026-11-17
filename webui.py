@@ -61,7 +61,7 @@ LAST_RUN_FILE = os.path.join(STATE_DIR, "ipsw-manager-last-run")
 RUN_STARTED_FILE = os.path.join(STATE_DIR, "ipsw-manager-run-started")
 # Log lines that end a run, for when LAST_RUN_FILE doesn't exist yet.
 RUN_END_MARKERS = ("✅ Done", "Run aborted", "skipping cleanup", "stopping without changes",
-                   "skipping download and cleanup", "is the NAS mounted")
+                   "skipping download and cleanup", "missing its .ipsw-manager marker")
 
 _speed_samples = {}  # .partial file name -> deque of (monotonic time, size)
 _speed_lock = threading.Lock()
@@ -84,7 +84,7 @@ def _with_timeout(fn, *args, fallback):
     try:
         return future.result(timeout=IO_TIMEOUT)
     except concurrent.futures.TimeoutError:
-        print(f"WARN: {name} timed out — the download folder's mount may be unavailable", flush=True)
+        print(f"WARN: {name} timed out — the download folder isn't responding", flush=True)
         return fallback
 
 
@@ -1647,7 +1647,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         scan = _with_timeout(scan_download_dir, fallback=None)
         if scan is None:
             folder_error = ("The download folder isn't responding, so its files can't be listed. "
-                            "The NAS may be offline or asleep.")
+                            "The drive or network share it's on may be disconnected, asleep or busy.")
             scan = {"files": [], "error": None, "selection": None, "disk": None}
         else:
             folder_error = scan["error"]
@@ -1668,7 +1668,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Without a listing, every phone would look missing.
         missing, unsigned = ([], []) if folder_error else missing_phones(files, selection, names, firmware)
 
-        logs = _with_timeout(get_log_tail, 200, fallback=["[log unavailable — mount may be offline]"])
+        logs = _with_timeout(get_log_tail, 200, fallback=["[log unavailable — the download folder isn't responding]"])
         return {
             "running": running,
             "reverifying": run == "reverify",
