@@ -1056,7 +1056,32 @@ button{padding:7px 15px;border-radius:6px;border:1px solid transparent;cursor:po
 .btn-sm{font-size:12px;padding:4px 10px}
 button:disabled{opacity:.4;cursor:not-allowed}
 button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-offset:1px}
-main{max-width:1120px;margin:0 auto;padding:24px;display:flex;flex-direction:column;gap:20px}
+main{max-width:1680px;margin:0 auto;padding:24px;display:flex;flex-direction:column;gap:20px}
+/* One column, in this order, until there's room for two (below). */
+.col{display:contents}
+.stats{order:0}#sec-files{order:1}#sec-cal{order:2}#sec-dev{order:3}#sec-hist{order:4}#sec-log{order:5}#settings{order:6}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
+.stats:empty{display:none}
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:13px 16px;min-width:0;border-top:3px solid var(--border)}
+.stat-ok{border-top-color:var(--green)}
+.stat-warn{border-top-color:var(--orange)}
+.stat-err{border-top-color:var(--red)}
+.stat-info{border-top-color:var(--blue)}
+.stat-lbl{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.stat-val{font-size:22px;font-weight:600;letter-spacing:-.4px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stat-ok .stat-val{color:var(--green)}
+.stat-warn .stat-val{color:var(--orange)}
+.stat-err .stat-val{color:var(--red)}
+.stat-sub{font-size:12px;color:var(--muted);margin-top:3px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
+@media (min-width:1200px){
+  main{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(420px,1fr);align-items:start}
+  .stats{grid-column:1/-1}
+  .col{display:flex;flex-direction:column;gap:20px;min-width:0}
+  .col-side .cal-day{min-height:62px}
+  .col-side .cal-foot>span:last-child{flex-basis:100%}
+  .col-side .fam{grid-template-columns:150px 1fr}
+  .log{max-height:560px}
+}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden}
 .card-hdr{padding:13px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
 .card-title{font-size:13px;font-weight:600}
@@ -1149,13 +1174,6 @@ tr.missing td:first-child{color:var(--text);font-weight:500;padding-left:30px}
 .btn-red{background:transparent;color:var(--red);border-color:var(--red)}
 .btn-red:hover:not(:disabled){background:var(--red-bg)}
 #btn-notify[aria-pressed="true"]{border-color:var(--blue)}
-.summary{padding:10px 18px;display:flex;flex-wrap:wrap;gap:6px;border-bottom:1px solid var(--border-soft)}
-.chip{font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;white-space:nowrap}
-.chip-ok{background:var(--green-bg);color:var(--green)}
-.chip-warn{background:var(--orange-bg);color:var(--orange)}
-.chip-err{background:var(--red-bg);color:var(--red)}
-.chip-info{background:var(--blue-bg);color:var(--blue)}
-.chip-muted{background:var(--gray-bg);color:var(--muted)}
 .dl-btn{margin-top:10px;color:var(--text)}
 .dl-btn:hover{background:var(--btn-gray-hover)}
 a.btn-gray{display:inline-block;text-decoration:none;font-weight:500;border:1px solid var(--border);border-radius:6px;white-space:nowrap}
@@ -1185,7 +1203,7 @@ details.card:not([open])>summary{border-bottom:none}
 .settings dd{min-width:0;overflow-wrap:anywhere}
 .settings .note{padding:0 18px 14px;font-size:12px;color:var(--muted)}
 @media (max-width:640px){
-  .summary,.settings dl,.settings .note,.dev-grid{padding-left:14px;padding-right:14px}
+  .settings dl,.settings .note,.dev-grid{padding-left:14px;padding-right:14px}
   .fam{grid-template-columns:1fr}
   .dev-grid{max-height:none}  /* one scroll, the page's, on a touch screen */
   .settings dl{grid-template-columns:1fr;gap:0}
@@ -1194,6 +1212,10 @@ details.card:not([open])>summary{border-bottom:none}
   header.running #btn-verify{display:none}  /* disabled during a run anyway; makes room for Stop */
   .spacer{display:none}  /* buttons that wrap to their own row stay on the left */
   main{padding:16px;gap:16px}
+  .stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  .stat{padding:10px 12px}
+  .stat:last-child:nth-child(odd){grid-column:1/-1}
+  .stat-val{font-size:18px}
   .hide-sm{display:none}
   th,td{padding:9px 7px}
   th:first-child,td:first-child{padding-left:12px}
@@ -1229,107 +1251,110 @@ details.card:not([open])>summary{border-bottom:none}
   </div>
 </header>
 <main>
-  <section class="card" aria-labelledby="files-title">
-    <div class="card-hdr">
-      <h2 class="card-title" id="files-title">Downloaded Firmware</h2>
-      <span class="card-meta" id="disk"></span>
-    </div>
-    <div id="summary" class="summary" aria-live="polite" hidden></div>
-    <div id="folder-err" class="banner sev-err" role="alert" hidden></div>
-    <div id="last-run" class="banner" hidden></div>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Model</th>
-            <th>iOS</th>
-            <th>Status</th>
-          </tr>
-        </thead>
-        <tbody id="files-body">
-          <tr><td colspan="3" class="empty">Loading…</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <div id="unsigned-note" class="card-foot" hidden></div>
-  </section>
-  <section class="card" aria-labelledby="cal-title">
-    <div class="card-hdr">
-      <h2 class="card-title" id="cal-title">Release Calendar</h2>
-      <div class="cal-nav">
-        <button class="btn-gray btn-sm" onclick="shiftMonth(-1)" aria-label="Previous month">&#8249;</button>
-        <span class="cal-month" id="cal-month" aria-live="polite"></span>
-        <button class="btn-gray btn-sm" onclick="shiftMonth(1)" aria-label="Next month">&#8250;</button>
-        <button class="btn-gray btn-sm" onclick="shiftMonth(0)">Today</button>
+  <div class="stats" id="stats" aria-live="polite"></div>
+  <div class="col col-main">
+    <section id="sec-files" class="card" aria-labelledby="files-title">
+      <div class="card-hdr">
+        <h2 class="card-title" id="files-title">Downloaded Firmware</h2>
+        <span class="card-meta" id="disk"></span>
       </div>
-    </div>
-    <div id="cal-errors"></div>
-    <div class="cal-grid" id="cal-grid"></div>
-    <div class="cal-foot">
-      <span class="ev ev-release">Release</span>
-      <span class="ev ev-beta">Beta</span>
-      <span class="ev ev-rc">Release candidate</span>
-      <span class="ev ev-expected">Expected</span>
-      <span>✓ = signed for your phones now. Apple doesn't announce dates: "expected" is a week after the release candidate.</span>
-    </div>
-    <div class="table-wrap">
-      <table class="cal-list">
-        <thead><tr><th>Date</th><th>Release</th><th>Build</th><th></th></tr></thead>
-        <tbody id="cal-list"><tr><td colspan="4" class="empty">Loading releases…</td></tr></tbody>
-      </table>
-    </div>
-  </section>
-  <section class="card" aria-labelledby="dev-title">
-    <div class="card-hdr">
-      <h2 class="card-title" id="dev-title">Phones to Download</h2>
-      <span class="card-meta" id="dev-count"></span>
-    </div>
-    <div class="dev-tools">
-      <input id="dev-filter" type="search" placeholder="Filter, e.g. 15 Pro or iPhone8" aria-label="Filter phones" oninput="renderDevices()">
-      <button id="btn-all" class="btn-gray" onclick="setVisible(true)">Select all</button>
-      <button id="btn-none" class="btn-gray" onclick="setVisible(false)">Select none</button>
-      <button id="btn-default" class="btn-gray" onclick="resetDefault()" title="Tick iPhone 11 and newer: what's downloaded until a selection is saved">Reset to default</button>
-      <button id="btn-save" class="btn-green" onclick="saveDevices()" disabled>Save</button>
-    </div>
-    <div class="dev-note" id="dev-note">Unticked phones' firmware is deleted on the next run.</div>
-    <div class="dev-grid" id="dev-grid"><div class="empty">Loading…</div></div>
-  </section>
-  <section class="card" aria-labelledby="hist-title">
-    <div class="card-hdr">
-      <h2 class="card-title" id="hist-title">Run History</h2>
-      <span class="card-meta" id="hist-meta"></span>
-    </div>
-    <div class="table-wrap">
-      <table class="hist">
-        <thead><tr><th>Started</th><th>Outcome</th></tr></thead>
-        <tbody id="hist-body"><tr><td colspan="2" class="empty">Loading…</td></tr></tbody>
-      </table>
-    </div>
-    <div class="card-foot" id="hist-foot" hidden><button class="btn-gray btn-sm" id="hist-more" onclick="toggleHistory()">Show all</button></div>
-  </section>
-  <section class="card" aria-labelledby="log-title">
-    <div class="card-hdr">
-      <h2 class="card-title" id="log-title">Log</h2>
-      <div class="log-tools">
-        <div class="seg" id="log-filter" role="group" aria-label="Show in the log">
-          <button data-filter="all" aria-pressed="true">All</button>
-          <button data-filter="problems" aria-pressed="false">Problems</button>
-          <button data-filter="latest" aria-pressed="false">Latest run</button>
+      <div id="folder-err" class="banner sev-err" role="alert" hidden></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th>iOS</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="files-body">
+            <tr><td colspan="3" class="empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="unsigned-note" class="card-foot" hidden></div>
+    </section>
+    <section id="sec-log" class="card" aria-labelledby="log-title">
+      <div class="card-hdr">
+        <h2 class="card-title" id="log-title">Log</h2>
+        <div class="log-tools">
+          <div class="seg" id="log-filter" role="group" aria-label="Show in the log">
+            <button data-filter="all" aria-pressed="true">All</button>
+            <button data-filter="problems" aria-pressed="false">Problems</button>
+            <button data-filter="latest" aria-pressed="false">Latest run</button>
+          </div>
+          <a class="btn-gray btn-sm" href="/api/log" download="ipsw-manager.log" title="Download the whole log file">&#10515; Download</a>
+          <button class="btn-gray btn-sm" onclick="scrollLog()">&#8595; End</button>
         </div>
-        <a class="btn-gray btn-sm" href="/api/log" download="ipsw-manager.log" title="Download the whole log file">&#10515; Download</a>
-        <button class="btn-gray btn-sm" onclick="scrollLog()">&#8595; End</button>
       </div>
-    </div>
-    <div id="log" class="log" tabindex="0" aria-label="Run log"></div>
-  </section>
-  <details class="card settings" id="settings">
-    <summary class="card-hdr">
-      <h2 class="card-title"><span class="chev" aria-hidden="true">›</span>Settings</h2>
-      <span class="card-meta" id="cfg-version"></span>
-    </summary>
-    <dl id="cfg"></dl>
-    <p class="note">These come from the container's environment variables (see the README). To change one, change it and recreate the container.</p>
-  </details>
+      <div id="log" class="log" tabindex="0" aria-label="Run log"></div>
+    </section>
+  </div>
+  <div class="col col-side">
+    <section id="sec-cal" class="card" aria-labelledby="cal-title">
+      <div class="card-hdr">
+        <h2 class="card-title" id="cal-title">Release Calendar</h2>
+        <div class="cal-nav">
+          <button class="btn-gray btn-sm" onclick="shiftMonth(-1)" aria-label="Previous month">&#8249;</button>
+          <span class="cal-month" id="cal-month" aria-live="polite"></span>
+          <button class="btn-gray btn-sm" onclick="shiftMonth(1)" aria-label="Next month">&#8250;</button>
+          <button class="btn-gray btn-sm" onclick="shiftMonth(0)">Today</button>
+        </div>
+      </div>
+      <div id="cal-errors"></div>
+      <div class="cal-grid" id="cal-grid"></div>
+      <div class="cal-foot">
+        <span class="ev ev-release">Release</span>
+        <span class="ev ev-beta">Beta</span>
+        <span class="ev ev-rc">Release candidate</span>
+        <span class="ev ev-expected">Expected</span>
+        <span>✓ = signed for your phones now. Apple doesn't announce dates: "expected" is a week after the release candidate.</span>
+      </div>
+      <div class="table-wrap">
+        <table class="cal-list">
+          <thead><tr><th>Date</th><th>Release</th><th>Build</th><th></th></tr></thead>
+          <tbody id="cal-list"><tr><td colspan="4" class="empty">Loading releases…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+    <section id="sec-dev" class="card" aria-labelledby="dev-title">
+      <div class="card-hdr">
+        <h2 class="card-title" id="dev-title">Phones to Download</h2>
+        <span class="card-meta" id="dev-count"></span>
+      </div>
+      <div class="dev-tools">
+        <input id="dev-filter" type="search" placeholder="Filter, e.g. 15 Pro or iPhone8" aria-label="Filter phones" oninput="renderDevices()">
+        <button id="btn-all" class="btn-gray" onclick="setVisible(true)">Select all</button>
+        <button id="btn-none" class="btn-gray" onclick="setVisible(false)">Select none</button>
+        <button id="btn-default" class="btn-gray" onclick="resetDefault()" title="Tick iPhone 11 and newer: what's downloaded until a selection is saved">Reset to default</button>
+        <button id="btn-save" class="btn-green" onclick="saveDevices()" disabled>Save</button>
+      </div>
+      <div class="dev-note" id="dev-note">Unticked phones' firmware is deleted on the next run.</div>
+      <div class="dev-grid" id="dev-grid"><div class="empty">Loading…</div></div>
+    </section>
+    <section id="sec-hist" class="card" aria-labelledby="hist-title">
+      <div class="card-hdr">
+        <h2 class="card-title" id="hist-title">Run History</h2>
+        <span class="card-meta" id="hist-meta"></span>
+      </div>
+      <div class="table-wrap">
+        <table class="hist">
+          <thead><tr><th>Started</th><th>Outcome</th></tr></thead>
+          <tbody id="hist-body"><tr><td colspan="2" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="card-foot" id="hist-foot" hidden><button class="btn-gray btn-sm" id="hist-more" onclick="toggleHistory()">Show all</button></div>
+    </section>
+    <details class="card settings" id="settings">
+      <summary class="card-hdr">
+        <h2 class="card-title"><span class="chev" aria-hidden="true">›</span>Settings</h2>
+        <span class="card-meta" id="cfg-version"></span>
+      </summary>
+      <dl id="cfg"></dl>
+      <p class="note">These come from the container's environment variables (see the README). To change one, change it and recreate the container.</p>
+    </details>
+  </div>
 </main>
 <script>
 const $ = id => document.getElementById(id);
@@ -1439,7 +1464,7 @@ async function refresh() {
     $("btn-stop").disabled = stopping;
     renderSchedule(d);
     renderBanners(d);
-    renderSummary(d);
+    renderStats(d);
     renderFiles();
     renderHistory(d);
     renderLog(d.logs);
@@ -1472,19 +1497,6 @@ function renderBanners(d) {
   const fe = $("folder-err");
   fe.hidden = !d.folder_error;
   setHTML(fe, d.folder_error ? '<span class="banner-label">Download folder</span><span>' + esc(d.folder_error) + '</span>' : "");
-
-  const lr = $("last-run");
-  if (!d.last_run) {
-    lr.hidden = true;
-  } else {
-    const m = d.last_run.match(/^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s+(.*)$/);
-    const when = m ? m[1] : null, text = m ? m[2] : d.last_run;
-    lr.className = "banner sev-" + (severity(text) || "info");
-    setHTML(lr, '<span class="banner-label">Last run'
-      + (when ? ' <span title="' + esc(fmt(when)) + '">' + esc(ago(when)) + '</span>' : "")
-      + '</span><span>' + esc(text) + '</span>');
-    lr.hidden = false;
-  }
 
   const disk = d.disk;
   $("disk").textContent = disk
@@ -1742,9 +1754,32 @@ async function doStop() {
 
 /* ---------- Summary ---------- */
 
-function renderSummary(d) {
-  const el = $("summary");
-  const files = d.downloads, missing = (d.missing || []).length;
+/* ---------- Stat tiles ---------- */
+
+function statTile(label, value, sub, sev, title) {
+  return '<div class="stat' + (sev ? " stat-" + sev : "") + '"' + (title ? ' title="' + esc(title) + '"' : "") + '>'
+    + '<div class="stat-lbl">' + esc(label) + '</div>'
+    + '<div class="stat-val">' + esc(value) + '</div>'
+    + (sub ? '<div class="stat-sub">' + esc(sub) + '</div>' : "") + '</div>';
+}
+
+// The next release on the calendar that hasn't happened yet, else the latest one.
+function nextRelease() {
+  const now = Date.now();
+  const ahead = calEvents.filter(e => e.date >= now).sort((a, b) => a.date - b.date)[0];
+  if (ahead) return {e: ahead, when: "expected " + rel(ahead.date.toISOString())};
+  // Several can land the same day (27.2.1 and 18.7.12, say): the newest iOS wins.
+  const past = calEvents.filter(e => e.kind === "release")
+    .sort((a, b) => dayKey(b.date).localeCompare(dayKey(a.date))
+      || b.title.localeCompare(a.title, undefined, {numeric: true}))[0];
+  return past ? {e: past, when: "released " + ago(past.date.toISOString())} : null;
+}
+
+function renderStats(d) {
+  d = d || lastStatus;
+  if (!d) return;
+  const tiles = [];
+  const files = d.downloads || [], missing = (d.missing || []).length;
   const c = {verified: 0, notChecked: 0, failed: 0, active: 0};
   files.forEach(f => {
     if (f.status === "downloading" || f.status === "verifying") c.active++;
@@ -1753,21 +1788,50 @@ function renderSummary(d) {
     else c.notChecked++;
   });
   const updates = files.filter(f => f.update).length;
-  const chips = [];
+
+  // Counts of a folder that couldn't be listed would mislead; its banner says why.
   if (d.folder_error) {
-    // The banner says it; counts of an unlisted folder would mislead.
-  } else if (files.length && c.verified === files.length && !missing && !updates) {
-    chips.push(["ok", "✓ All " + c.verified + " verified and up to date"]);
+    tiles.push(statTile("Firmware", "Unavailable", "The download folder isn't responding", "err"));
   } else {
-    if (c.verified) chips.push(["ok", c.verified + " verified"]);
-    if (c.active) chips.push(["info", c.active + " in progress"]);
-    if (c.notChecked) chips.push(["warn", c.notChecked + " not checked"]);
-    if (c.failed) chips.push(["warn", c.failed + (c.failed === 1 ? " check" : " checks") + " failed"]);
-    if (missing) chips.push(["muted", missing + " not downloaded"]);
-    if (updates) chips.push(["warn", updates + " with a newer iOS available"]);
+    const disk = d.disk;
+    tiles.push(statTile("Firmware stored", files.length + (files.length === 1 ? " file" : " files"),
+      disk ? disk.used_human + (disk.free_human ? " used · " + disk.free_human + " free" : " used") : ""));
+
+    const rest = [];
+    if (c.active) rest.push(c.active + " in progress");
+    if (c.notChecked) rest.push(c.notChecked + " not checked");
+    if (c.failed) rest.push(c.failed + (c.failed === 1 ? " check" : " checks") + " failed");
+    tiles.push(statTile("Verified", files.length ? c.verified + " / " + files.length : "—",
+      rest.join(" · ") || (files.length ? "Every stored file passed its check" : "Nothing stored yet"),
+      c.failed ? "err" : c.notChecked ? "warn" : c.active ? "info" : files.length ? "ok" : ""));
+
+    const todo = [];
+    if (missing) todo.push(missing + " not downloaded");
+    if (updates) todo.push(updates + " with a newer iOS");
+    tiles.push(statTile("Phones", todo.length ? missing + updates + " waiting" : "Up to date",
+      todo.join(" · ") || "Every ticked phone has its latest signed iOS",
+      todo.length ? "warn" : files.length ? "ok" : ""));
   }
-  el.hidden = !chips.length;
-  setHTML(el, chips.map(([k, t]) => '<span class="chip chip-' + k + '">' + esc(t) + '</span>').join(""));
+
+  if (d.running) {
+    tiles.push(statTile("Run", stopping ? "Stopping…" : d.reverifying ? "Re-verifying…" : "Running…",
+      d.current_run && d.current_run.started ? "started " + ago(d.current_run.started) : "", "info"));
+  } else if (d.last_run) {
+    const m = d.last_run.match(/^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s+(.*)$/);
+    const when = m ? m[1] : null, text = m ? m[2] : d.last_run;
+    tiles.push(statTile("Last run", when ? ago(when) : "—", text, severity(text) || "info",
+      (when ? fmt(when) + ": " : "") + text));
+  } else {
+    tiles.push(statTile("Last run", "Never", "No run has finished yet"));
+  }
+
+  const next = calLoaded ? nextRelease() : null;
+  if (next) {
+    tiles.push(statTile(next.e.kind === "release" ? "Latest release" : "Next release", next.e.title,
+      EV_LABEL[next.e.kind] + " · " + next.when + (next.e.signed ? " · signed" : ""),
+      next.e.kind === "release" ? "" : "info", next.e.date.toLocaleString()));
+  }
+  setHTML($("stats"), tiles.join(""));
 }
 
 /* ---------- Run history ---------- */
@@ -2253,6 +2317,7 @@ async function loadCalendar() {
     calLoaded = true;
     $("cal-errors").innerHTML = d.errors.map(m => '<div class="cal-err">⚠ ' + esc(m) + '</div>').join("");
     renderCalendar();
+    renderStats();
   } catch (e) {
     if (!calLoaded) $("cal-list").innerHTML = '<tr><td colspan="4" class="empty">' + esc(e.message) + '</td></tr>';
     else $("cal-errors").innerHTML = '<div class="cal-err">⚠ ' + esc(e.message) + '</div>';
