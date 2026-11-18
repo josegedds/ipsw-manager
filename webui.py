@@ -372,7 +372,9 @@ def _read_cached(path, parse):
 
 def _parse_hash(text):
     fields = text.split()
-    return (int(fields[3]), int(fields[4])) if len(fields) >= 5 and fields[0] == "v2" else None
+    if len(fields) < 5 or fields[0] != "v2":
+        return None
+    return int(fields[3]), int(fields[4]), fields[1], fields[2]
 
 
 def _parse_check_failed(text):
@@ -381,7 +383,9 @@ def _parse_check_failed(text):
 
 
 def read_cache_entry(cache):
-    """(size in bytes, Unix time checked) from a hash cache file.
+    """(size in bytes, Unix time checked, algorithm, checksum) from a hash
+    cache file. The checksum is the one the stored copy was read back with
+    ("-" when there's none and the file was tested as a ZIP archive).
 
     None if the file isn't there or predates the read-back check: those
     entries only recorded the download's checksum, not the stored copy's.
@@ -462,6 +466,8 @@ def scan_download_dir():
             "verified": verified,
             "checked": datetime.fromtimestamp(entry[1], tz=timezone.utc).isoformat()
             if verified else None,
+            # What the stored copy hashed to when it was read back.
+            "checksum": {"algo": entry[2], "value": entry[3]} if verified else None,
             # When a run will next read it back (see IPSW_REVERIFY_DAYS).
             "next_check": datetime.fromtimestamp(entry[1] + REVERIFY_DAYS * 86400, tz=timezone.utc).isoformat()
             if verified and REVERIFY_DAYS else None,
@@ -1070,6 +1076,7 @@ tbody tr:last-child td{border-bottom:none}
 tbody tr:hover td{background:var(--hover)}
 .muted{color:var(--muted)}
 .mono{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:12px}
+.checksum{word-break:break-all;user-select:all}
 .sub{display:block;font-size:11px;color:var(--muted);margin-top:3px;max-width:340px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sub.warn{color:var(--orange)}
 .ios,.ios .sub{white-space:nowrap}
@@ -1548,6 +1555,11 @@ function fileDetail(f) {
       ? esc(fmt(f.checked) + ": read back from the download folder and matched its checksum")
       : f.partial ? "Checked once the download finishes" : "Never: not yet read back and checked"],
   ];
+  if (f.verified && f.checksum) {
+    rows.push(["Checksum", f.checksum.value && f.checksum.value !== "-"
+      ? '<span class="mono checksum">' + esc(f.checksum.algo.toUpperCase() + " " + f.checksum.value) + '</span>'
+      : "None published by ipsw.me, so tested as a ZIP archive"]);
+  }
   if (f.verified) {
     rows.push(["Next check", f.next_check
       ? esc(fmt(f.next_check) + " (" + rel(f.next_check) + "). A run reads it back again then.")
