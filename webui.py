@@ -254,6 +254,13 @@ def extract_identifiers(name):
     return FILE_IDENTIFIER_RE.findall(name.split("_", 1)[0])
 
 
+def identifiers_from_firmware(name, firmware):
+    """Phones whose ipsw.me firmware list includes this file name, for names
+    like iPhone_4.7_P3_15.8.8_19H422_Restore.ipsw that don't carry identifiers."""
+    return sorted((i for i, info in firmware.items() if name in info.get("files", ())),
+                  key=_identifier_key, reverse=True)
+
+
 def model_name(identifiers, names):
     """Marketing name for a firmware's devices, e.g. "iPhone X".
 
@@ -841,7 +848,13 @@ def _lookup_firmware(identifier):
     signed = [f for f in data.get("firmwares", []) if f.get("signed") and f.get("version")]
     public = [f for f in signed if "beta" not in f["version"]]
     latest = max(public, key=lambda f: f.get("releasedate") or "", default=None)
-    return {"signed": {f["version"] for f in signed}, "latest": latest["version"] if latest else None}
+    return {
+        "signed": {f["version"] for f in signed},
+        "latest": latest["version"] if latest else None,
+        # Every IPSW file name this phone can use, signed or not. Older phones
+        # share files named by screen size (iPhone_4.7_P3_…), not identifier.
+        "files": {f["url"].rsplit("/", 1)[-1] for f in data.get("firmwares", []) if f.get("url")},
+    }
 
 
 def _refresh_firmware(identifiers):
@@ -2367,6 +2380,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             selection = default_selection(_device_cache["devices"])
         selection = [i for i in selection or [] if IDENTIFIER_RE.match(i)]
         firmware = signed_firmware(selection + [i for f in files for i in f["identifiers"]])
+        unnamed = [f for f in files if not f["identifiers"]]
+        if unnamed:
+            # Files named by screen size: ask about every known phone (as the
+            # phone picker does) so they're matched even when not selected.
+            firmware = signed_firmware(selection + [d["identifier"] for d in _device_cache["devices"]]
+                                       + [i for f in files for i in f["identifiers"]])
+            for f in unnamed:
+                f["identifiers"] = identifiers_from_firmware(f["name"], firmware)
 
         for f in files:
             f["model"] = model_name(f["identifiers"], names)
