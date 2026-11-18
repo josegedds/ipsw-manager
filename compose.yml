@@ -27,6 +27,8 @@ services:
       # Read each stored file back and check it again this often (days).
       # 0 checks a file only when it's downloaded.
       IPSW_REVERIFY_DAYS: "30"
+      # Download links for stored IPSWs in the web UI. "0" turns them off.
+      # WEBUI_DOWNLOADS: "1"
     volumes:
       # Where the IPSWs, the log and the phone selection are kept.
       - /path/to/ipsw:/downloads

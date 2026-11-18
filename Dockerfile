@@ -43,6 +43,8 @@ HEALTHCHECK --interval=1m --timeout=5s --start-period=15s \
 ENTRYPOINT ["/sbin/tini", "--", "/entrypoint.sh"]
 
 ARG VERSION=dev
+# Shown in the web UI's Settings panel.
+ENV IPSW_MANAGER_VERSION=${VERSION}
 LABEL org.opencontainers.image.title="ipsw-manager" \
       org.opencontainers.image.description="Keeps a folder of the latest signed iPhone firmware (IPSW) files, with a web dashboard" \
       org.opencontainers.image.source="https://github.com/josegedds/ipsw-manager" \
