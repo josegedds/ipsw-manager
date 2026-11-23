@@ -631,6 +631,22 @@ run_summary() {
   printf '%s' "$S"
 }
 
+# The phones whose firmware lookup failed, e.g. "iPhone9,1" or
+# "2 phones: iPhone9,1, iPhone9,3". The web UI adds their names.
+failed_phones() {
+  local F IDS=() LIST
+  for F in "$META_DIR"/*.failed; do
+    [[ -e "$F" ]] && IDS+=("$(basename "$F" .failed)")
+  done
+  LIST=$(printf '%s, ' "${IDS[@]}")
+  LIST=${LIST%, }
+  if (( ${#IDS[@]} == 1 )); then
+    printf '%s' "$LIST"
+  else
+    printf '%s phones: %s' "${#IDS[@]}" "$LIST"
+  fi
+}
+
 # When the scheduled checks will try a run that didn't finish cleanly again.
 retry_note() {
   if [[ "${CHECK_INTERVAL:-0}" =~ ^[1-9][0-9]*$ ]]; then
@@ -951,7 +967,7 @@ if (( UNIQUE_COUNT == 0 )); then
   FAILED=("$META_DIR"/*.failed)
   if [[ -e "${FAILED[0]}" ]]; then
     check_unlisted
-    finish 1 "⚠️  Firmware lookup failed for ${#FAILED[@]} phone(s) — skipping download and cleanup.$(run_summary)$(retry_note)"
+    finish 1 "⚠️  Firmware lookup failed for $(failed_phones) — skipping download and cleanup.$(run_summary)$(retry_note)"
   fi
   finish 0 "⚠️  No signed firmware found for the selected phones — skipping download and cleanup."
 fi
@@ -987,7 +1003,9 @@ fi
 FAILED=("$META_DIR"/*.failed)
 if [[ -e "${FAILED[0]}" ]]; then
   check_unlisted
-  finish 1 "⚠️  Firmware lookup failed for ${#FAILED[@]} phone(s) — skipping cleanup so their IPSWs aren't deleted.$(run_summary)$(retry_note)"
+  KEPT="their IPSWs aren't"
+  (( ${#FAILED[@]} == 1 )) && KEPT="its IPSW isn't"
+  finish 1 "⚠️  Firmware lookup failed for $(failed_phones) — skipping cleanup so $KEPT deleted.$(run_summary)$(retry_note)"
 fi
 
 if (( DOWNLOAD_FAILURES > 0 || CHECK_FAILURES > 0 )); then

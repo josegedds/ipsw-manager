@@ -275,6 +275,25 @@ def model_name(identifiers, names):
     return " / ".join(dict.fromkeys(found))
 
 
+def with_phone_names(text, names):
+    """Text with each identifier given its phone's name: "iPhone8,1" becomes
+    "iPhone 6s (iPhone8,1)", and "iPhone12,8" "iPhone SE (2nd generation, iPhone12,8)".
+
+    The script only knows identifiers; this is for run outcomes shown on the dashboard.
+    """
+    if not text:
+        return text
+
+    def named(m):
+        identifier, name = m.group(0), names.get(m.group(0))
+        if not name:
+            return identifier
+        if name.endswith(")"):
+            return f"{name[:-1]}, {identifier})"
+        return f"{name} ({identifier})"
+    return FILE_IDENTIFIER_RE.sub(named, text)
+
+
 def device_names():
     """identifier -> name from the cached ipsw.me list, without blocking on the network.
 
@@ -1905,9 +1924,11 @@ function updateTitle() {
 }
 
 // A new "last run" line means a run ended. If nobody's looking, say so in the
-// tab title and, if turned on, with a notification.
+// tab title and, if turned on, with a notification. Compared by its time, as
+// its text gains phone names once they've been fetched from ipsw.me.
+const runEndKey = t => t ? (t.match(/^\d{4}-\d\d-\d\d[T ][\d:]+Z?/) || [t])[0] : t;
 function noticeRunEnd(d) {
-  if (prevLastRun !== undefined && d.last_run && d.last_run !== prevLastRun && document.hidden) {
+  if (prevLastRun !== undefined && d.last_run && runEndKey(d.last_run) !== runEndKey(prevLastRun) && document.hidden) {
     const text = outcomeText(d.last_run), sev = severity(text);
     titleNotice = (sev === "err" ? "✗" : sev === "warn" ? "⚠" : "✓") + " Run finished";
     updateTitle();
@@ -2493,9 +2514,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "disk": scan["disk"],
             "schedule": schedule_info(),
             "logs": logs,
-            "last_run": get_last_run(logs, running),
+            "last_run": with_phone_names(get_last_run(logs, running), names),
             "current_run": current,
-            "history": runs[:HISTORY_MAX],
+            "history": [dict(r, outcome=with_phone_names(r["outcome"], names)) for r in runs[:HISTORY_MAX]],
             "history_available": history is not None,
             "download_links": DOWNLOAD_LINKS,
             "download_dir": DOWNLOAD_DIR,
